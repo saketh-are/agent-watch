@@ -11,13 +11,44 @@
       <div class="ambient ambient-left"></div>
       <div class="ambient ambient-right"></div>
       <header class="site-header">
-        <div class="site-header__copy">
-          <p id="site-title" class="eyebrow">Agent Watch</p>
-          <p id="site-subtitle" class="site-subtitle"></p>
+        <div class="site-header__top">
+          <div class="site-header__copy">
+            <p id="site-title" class="eyebrow">Agent Watch</p>
+            <p id="site-subtitle" class="site-subtitle"></p>
+          </div>
+          <button id="config-button" class="site-header__button" type="button" aria-label="Open config editor">
+            ⚙️
+          </button>
         </div>
         <nav id="site-nav" class="site-nav" aria-label="Primary"></nav>
       </header>
       <main id="app" class="app-root" aria-live="polite"></main>
+      <div id="config-modal" class="config-modal" hidden>
+        <div class="config-modal__backdrop" data-config-close></div>
+        <section class="config-modal__panel" role="dialog" aria-modal="true" aria-labelledby="config-modal-title">
+          <header class="config-modal__header">
+            <div>
+              <p class="eyebrow">Config</p>
+              <h2 id="config-modal-title">Dashboard Config</h2>
+              <p id="config-path" class="config-modal__path"></p>
+            </div>
+            <button class="config-modal__close" type="button" data-config-close aria-label="Close config editor">
+              Close
+            </button>
+          </header>
+          <label class="config-modal__editor">
+            <span class="config-modal__label">JSON</span>
+            <textarea id="config-editor" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+          </label>
+          <footer class="config-modal__footer">
+            <p id="config-status" class="config-modal__status" aria-live="polite"></p>
+            <div class="config-modal__actions">
+              <button id="config-reload" class="agent-button agent-button--secondary" type="button">Reload</button>
+              <button id="config-save" class="agent-button" type="button">Save</button>
+            </div>
+          </footer>
+        </section>
+      </div>
     </div>
     <script type="module" src="/app.js"></script>
   </body>

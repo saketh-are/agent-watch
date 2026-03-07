@@ -78,6 +78,7 @@ proxy.on('error', (error, req, resOrSocket) => {
 });
 
 app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/config', (_req, res) => {
   try {
@@ -87,6 +88,42 @@ app.get('/api/config', (_req, res) => {
   } catch (error) {
     res.status(500).json({
       error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+  }
+});
+
+app.get('/api/config-file', (_req, res) => {
+  try {
+    const { raw } = readConfigFile();
+    res.setHeader('cache-control', 'no-store');
+    res.json({
+      path: configPath,
+      raw
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+  }
+});
+
+app.put('/api/config-file', (req, res) => {
+  try {
+    const raw = String(req.body?.raw || '');
+    const saved = writeConfigFile(raw);
+    const config = loadConfig();
+    res.setHeader('cache-control', 'no-store');
+    res.json({
+      ok: true,
+      path: configPath,
+      raw: saved,
+      config: buildPublicConfig(config)
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: 'Could not save dashboard configuration',
       detail: error.message
     });
   }
@@ -197,28 +234,8 @@ server.listen(port, host, () => {
 });
 
 function loadConfig() {
-  if (!fs.existsSync(configPath)) {
-    return {
-      site: {
-        title: 'Agent Watch',
-        subtitle: 'Private ttyd dashboard for live agent sessions'
-      },
-      agents: []
-    };
-  }
-
-  const raw = fs.readFileSync(configPath, 'utf8');
-  const parsed = JSON.parse(raw);
-  const agents = Array.isArray(parsed.agents) ? parsed.agents : [];
-  validateAgents(agents);
-
-  return {
-    site: {
-      title: parsed.site?.title || 'Agent Watch',
-      subtitle: parsed.site?.subtitle || 'Private ttyd dashboard for live agent sessions'
-    },
-    agents
-  };
+  const { raw } = readConfigFile();
+  return normalizeConfig(JSON.parse(raw));
 }
 
 function buildPublicConfig(config) {
@@ -258,6 +275,59 @@ function validateAgents(agents) {
       new URL(agent.previewTarget);
     }
   }
+}
+
+function readConfigFile() {
+  if (!fs.existsSync(configPath)) {
+    return {
+      raw: `${JSON.stringify(getDefaultConfig(), null, 2)}\n`
+    };
+  }
+
+  return {
+    raw: fs.readFileSync(configPath, 'utf8')
+  };
+}
+
+function writeConfigFile(raw) {
+  const parsed = JSON.parse(raw);
+  const normalized = normalizeConfig(parsed);
+  const serialized = `${JSON.stringify(
+    {
+      site: normalized.site,
+      agents: normalized.agents
+    },
+    null,
+    2
+  )}\n`;
+
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, serialized, 'utf8');
+  return serialized;
+}
+
+function normalizeConfig(parsed) {
+  const config = parsed && typeof parsed === 'object' ? parsed : {};
+  const agents = Array.isArray(config.agents) ? config.agents : [];
+  validateAgents(agents);
+
+  return {
+    site: {
+      title: config.site?.title || 'Agent Watch',
+      subtitle: config.site?.subtitle || 'Private ttyd dashboard for live agent sessions'
+    },
+    agents
+  };
+}
+
+function getDefaultConfig() {
+  return {
+    site: {
+      title: 'Agent Watch',
+      subtitle: 'Private ttyd dashboard for live agent sessions'
+    },
+    agents: []
+  };
 }
 
 function getUpstream(agent, mode) {

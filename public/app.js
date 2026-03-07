@@ -2,12 +2,26 @@ const app = document.querySelector('#app');
 const nav = document.querySelector('#site-nav');
 const siteTitle = document.querySelector('#site-title');
 const siteSubtitle = document.querySelector('#site-subtitle');
+const configButton = document.querySelector('#config-button');
+const configModal = document.querySelector('#config-modal');
+const configPath = document.querySelector('#config-path');
+const configEditor = document.querySelector('#config-editor');
+const configStatus = document.querySelector('#config-status');
+const configReloadButton = document.querySelector('#config-reload');
+const configSaveButton = document.querySelector('#config-save');
+const agentOrderStorageKey = 'agent-watch.agent-order';
 
 let route = getRoute(window.location.pathname);
 
 const state = {
   config: null,
   activeHomeAgentId: null,
+  configModalOpen: false,
+  drag: {
+    agentId: null,
+    targetId: null,
+    position: null
+  },
   views: {
     empty: null,
     home: null,
@@ -33,6 +47,27 @@ window.addEventListener('popstate', () => {
 });
 
 document.addEventListener('click', handleDocumentClick);
+nav.addEventListener('dragstart', handleNavDragStart);
+nav.addEventListener('dragover', handleNavDragOver);
+nav.addEventListener('drop', handleNavDrop);
+nav.addEventListener('dragend', handleNavDragEnd);
+configButton?.addEventListener('click', () => {
+  openConfigModal().catch((error) => {
+    setConfigStatus(error.message, true);
+  });
+});
+configModal?.addEventListener('click', handleConfigModalClick);
+document.addEventListener('keydown', handleDocumentKeydown);
+configReloadButton?.addEventListener('click', () => {
+  loadConfigEditor().catch((error) => {
+    setConfigStatus(error.message, true);
+  });
+});
+configSaveButton?.addEventListener('click', () => {
+  saveConfigEditor().catch((error) => {
+    setConfigStatus(error.message, true);
+  });
+});
 
 async function boot() {
   const response = await fetch('/api/config', { cache: 'no-store' });
@@ -40,7 +75,7 @@ async function boot() {
     throw new Error(`Request failed with ${response.status}`);
   }
 
-  state.config = await response.json();
+  state.config = applyStoredAgentOrder(await response.json());
   initializeViews(state.config);
   renderCurrentRoute();
 }
@@ -116,7 +151,9 @@ function renderShell(config, routeAgent) {
       href: `/agents/${agent.id}`,
       label: agent.name,
       active: route.kind === 'agent' && route.agentId === agent.id,
-      accent: agent.accent
+      accent: agent.accent,
+      agentId: agent.id,
+      draggable: true
     }))
   ];
 
@@ -124,8 +161,9 @@ function renderShell(config, routeAgent) {
     .map(
       (link) => `
         <a
-          class="nav-link ${link.active ? 'is-active' : ''}"
+          class="nav-link ${link.active ? 'is-active' : ''} ${link.draggable ? 'is-draggable' : ''}"
           href="${link.href}"
+          ${link.draggable ? `draggable="true" data-nav-agent-id="${escapeAttr(link.agentId)}"` : ''}
           ${link.accent ? `style="--agent-accent:${escapeAttr(link.accent)}"` : ''}
         >
           ${escapeHtml(link.label)}
@@ -282,6 +320,10 @@ function handleDocumentClick(event) {
     return;
   }
 
+  if (state.configModalOpen) {
+    return;
+  }
+
   const link = event.target.closest('a[href]');
   if (!link || !shouldHandleNavigation(event, link)) {
     retainHomeTerminalFocus(event.target);
@@ -334,6 +376,348 @@ function navigateTo(href) {
   history.pushState({}, '', nextPath);
   route = getRoute(url.pathname);
   renderCurrentRoute();
+}
+
+async function openConfigModal() {
+  state.configModalOpen = true;
+  document.body.classList.add('is-modal-open');
+  configModal?.removeAttribute('hidden');
+  await loadConfigEditor();
+  configEditor?.focus({ preventScroll: true });
+}
+
+function closeConfigModal() {
+  state.configModalOpen = false;
+  document.body.classList.remove('is-modal-open');
+  configModal?.setAttribute('hidden', '');
+  clearConfigStatus();
+}
+
+function handleConfigModalClick(event) {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+
+  if (event.target.closest('[data-config-close]')) {
+    closeConfigModal();
+  }
+}
+
+function handleDocumentKeydown(event) {
+  if (event.key === 'Escape' && state.configModalOpen) {
+    event.preventDefault();
+    closeConfigModal();
+  }
+}
+
+async function loadConfigEditor() {
+  setConfigStatus('Loading...');
+  setConfigEditorBusy(true);
+
+  try {
+    const response = await fetch('/api/config-file', { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Request failed with ${response.status}`);
+    }
+
+    if (configPath) {
+      configPath.textContent = payload.path || '';
+    }
+
+    if (configEditor) {
+      configEditor.value = payload.raw || '';
+    }
+
+    clearConfigStatus();
+  } finally {
+    setConfigEditorBusy(false);
+  }
+}
+
+async function saveConfigEditor() {
+  const raw = configEditor?.value || '';
+  const currentActiveHomeAgentId = state.activeHomeAgentId;
+
+  setConfigStatus('Saving...');
+  setConfigEditorBusy(true);
+
+  try {
+    const response = await fetch('/api/config-file', {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ raw })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Request failed with ${response.status}`);
+    }
+
+    if (configEditor) {
+      configEditor.value = payload.raw || raw;
+    }
+
+    state.config = applyStoredAgentOrder(payload.config);
+    const nextActiveHomeAgentId = state.config.agents.some((agent) => agent.id === currentActiveHomeAgentId)
+      ? currentActiveHomeAgentId
+      : null;
+
+    initializeViews(state.config);
+    state.activeHomeAgentId = nextActiveHomeAgentId;
+    renderCurrentRoute();
+    setConfigStatus('Saved.');
+  } finally {
+    setConfigEditorBusy(false);
+  }
+}
+
+function setConfigEditorBusy(isBusy) {
+  configEditor?.toggleAttribute('readonly', isBusy);
+  if (configReloadButton instanceof HTMLButtonElement) {
+    configReloadButton.disabled = isBusy;
+  }
+  if (configSaveButton instanceof HTMLButtonElement) {
+    configSaveButton.disabled = isBusy;
+  }
+}
+
+function setConfigStatus(message, isError = false) {
+  if (!configStatus) {
+    return;
+  }
+
+  configStatus.textContent = message;
+  configStatus.classList.toggle('is-error', isError);
+}
+
+function clearConfigStatus() {
+  if (!configStatus) {
+    return;
+  }
+
+  configStatus.textContent = '';
+  configStatus.classList.remove('is-error');
+}
+
+function handleNavDragStart(event) {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+
+  const link = event.target.closest('[data-nav-agent-id]');
+  if (!(link instanceof HTMLAnchorElement)) {
+    return;
+  }
+
+  const { navAgentId: agentId } = link.dataset;
+  if (!agentId) {
+    return;
+  }
+
+  state.drag.agentId = agentId;
+  link.classList.add('is-dragging');
+
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', agentId);
+  }
+}
+
+function handleNavDragOver(event) {
+  if (!state.drag.agentId || !(event.target instanceof Element)) {
+    return;
+  }
+
+  const link = event.target.closest('[data-nav-agent-id]');
+  if (!(link instanceof HTMLAnchorElement)) {
+    clearNavDropIndicator();
+    return;
+  }
+
+  const { navAgentId: targetId } = link.dataset;
+  if (!targetId || targetId === state.drag.agentId) {
+    clearNavDropIndicator();
+    return;
+  }
+
+  event.preventDefault();
+
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move';
+  }
+
+  setNavDropIndicator(targetId, getNavDropPosition(link, event.clientX));
+}
+
+function handleNavDrop(event) {
+  if (!state.drag.agentId || !(event.target instanceof Element)) {
+    return;
+  }
+
+  const link = event.target.closest('[data-nav-agent-id]');
+  if (!(link instanceof HTMLAnchorElement)) {
+    clearNavDragState();
+    return;
+  }
+
+  const { navAgentId: targetId } = link.dataset;
+  if (!targetId || targetId === state.drag.agentId || !state.drag.position) {
+    clearNavDragState();
+    return;
+  }
+
+  event.preventDefault();
+  reorderAgents(state.drag.agentId, targetId, state.drag.position);
+  clearNavDragState();
+}
+
+function handleNavDragEnd() {
+  clearNavDragState();
+}
+
+function getNavDropPosition(link, clientX) {
+  const bounds = link.getBoundingClientRect();
+  return clientX < bounds.left + bounds.width / 2 ? 'before' : 'after';
+}
+
+function setNavDropIndicator(targetId, position) {
+  clearNavDropIndicator();
+
+  state.drag.targetId = targetId;
+  state.drag.position = position;
+
+  const target = nav.querySelector(`[data-nav-agent-id="${CSS.escape(targetId)}"]`);
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  target.classList.add(position === 'before' ? 'is-drop-before' : 'is-drop-after');
+}
+
+function clearNavDropIndicator() {
+  if (state.drag.targetId) {
+    const previousTarget = nav.querySelector(`[data-nav-agent-id="${CSS.escape(state.drag.targetId)}"]`);
+    previousTarget?.classList.remove('is-drop-before', 'is-drop-after');
+  }
+
+  state.drag.targetId = null;
+  state.drag.position = null;
+}
+
+function clearNavDragState() {
+  if (state.drag.agentId) {
+    const source = nav.querySelector(`[data-nav-agent-id="${CSS.escape(state.drag.agentId)}"]`);
+    source?.classList.remove('is-dragging');
+  }
+
+  clearNavDropIndicator();
+  state.drag.agentId = null;
+}
+
+function reorderAgents(sourceId, targetId, position) {
+  const sourceIndex = state.config?.agents.findIndex((agent) => agent.id === sourceId) ?? -1;
+  const targetIndex = state.config?.agents.findIndex((agent) => agent.id === targetId) ?? -1;
+
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+    return;
+  }
+
+  const nextAgents = [...state.config.agents];
+  const [movedAgent] = nextAgents.splice(sourceIndex, 1);
+  let insertIndex = nextAgents.findIndex((agent) => agent.id === targetId);
+
+  if (insertIndex < 0) {
+    return;
+  }
+
+  if (position === 'after') {
+    insertIndex += 1;
+  }
+
+  nextAgents.splice(insertIndex, 0, movedAgent);
+  state.config.agents = nextAgents;
+  saveStoredAgentOrder(nextAgents);
+  syncAgentOrder();
+}
+
+function syncAgentOrder() {
+  const routeAgent = route.kind === 'agent'
+    ? state.config.agents.find((agent) => agent.id === route.agentId) || null
+    : null;
+
+  renderShell(state.config, routeAgent);
+  syncHomeCardOrder();
+  focusRouteTerminal();
+}
+
+function syncHomeCardOrder() {
+  const homeView = state.views.home;
+  if (!homeView) {
+    return;
+  }
+
+  for (const agent of state.config.agents) {
+    const card = homeView.querySelector(`[data-agent-card="${CSS.escape(agent.id)}"]`);
+    if (card) {
+      homeView.append(card);
+    }
+  }
+}
+
+function applyStoredAgentOrder(config) {
+  const storedOrder = loadStoredAgentOrder();
+  if (!storedOrder.length || !Array.isArray(config.agents)) {
+    return config;
+  }
+
+  const agentsById = new Map(config.agents.map((agent) => [agent.id, agent]));
+  const orderedAgents = [];
+
+  for (const agentId of storedOrder) {
+    const agent = agentsById.get(agentId);
+    if (!agent) {
+      continue;
+    }
+
+    orderedAgents.push(agent);
+    agentsById.delete(agentId);
+  }
+
+  for (const agent of config.agents) {
+    if (agentsById.has(agent.id)) {
+      orderedAgents.push(agent);
+    }
+  }
+
+  return {
+    ...config,
+    agents: orderedAgents
+  };
+}
+
+function loadStoredAgentOrder() {
+  try {
+    const raw = window.localStorage.getItem(agentOrderStorageKey);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredAgentOrder(agents) {
+  try {
+    window.localStorage.setItem(
+      agentOrderStorageKey,
+      JSON.stringify(agents.map((agent) => agent.id))
+    );
+  } catch {}
 }
 
 function disconnectHomeTerminals() {
@@ -459,7 +843,7 @@ function focusRouteTerminal() {
 }
 
 function retainHomeTerminalFocus(target) {
-  if (route.kind !== 'home' || !(target instanceof Element)) {
+  if (state.configModalOpen || route.kind !== 'home' || !(target instanceof Element)) {
     return;
   }
 
