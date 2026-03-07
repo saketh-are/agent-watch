@@ -1,0 +1,30 @@
+{
+  "site": {
+    "title": "Agent Watch",
+    "subtitle": "Private ttyd dashboard for live agent sessions"
+  },
+  "agents": [
+    {
+      "id": "alpha",
+      "name": "Agent Alpha",
+      "description": "Interactive agent session on vm-alpha",
+      "badge": "prod",
+      "accent": "#d06d32",
+      "target": "http://127.0.0.1:7681/",
+      "previewTarget": "http://127.0.0.1:7681/"
+    },
+    {
+      "id": "beta",
+      "name": "Agent Beta",
+      "description": "Indexer and background jobs on vm-beta",
+      "badge": "staging",
+      "accent": "#2d7d6a",
+      "target": "http://127.0.0.1:7682/",
+      "previewTarget": "http://127.0.0.1:7682/",
+      "insecureSkipVerify": true,
+      "headers": {
+        "x-forwarded-user": "operator"
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "agent-watch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small HTTPS dashboard for monitoring multiple ttyd-backed agent sessions.",
+  "scripts": {
+    "start": "node server/server.mjs",
+    "start:http": "HTTP_ONLY=1 node server/server.mjs",
+    "dev": "node --watch server/server.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "http-proxy": "^1.18.1",
+    "selfsigned": "^3.0.1"
+  }
+}
