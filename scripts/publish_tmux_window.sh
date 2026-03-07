@@ -27,6 +27,7 @@ mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/agent-watch"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/agent-watch"
 
 tmux has-session -t "$source_session"
+tmux set -ga terminal-features ',xterm-256color:RGB,xterm-direct:RGB'
 
 if ! tmux has-session -t "$group_session" 2>/dev/null; then
   tmux new-session -d -t "$source_session" -s "$group_session"
@@ -38,11 +39,11 @@ pkill -f "ttyd -i 127.0.0.1 -p ${preview_port} " || true
 pkill -f "ttyd -i 127.0.0.1 -p ${detail_port} " || true
 sleep 0.5
 
-nohup ttyd -i 127.0.0.1 -p "$preview_port" -R -t disableLeaveAlert=true \
+nohup ttyd -T xterm-direct -i 127.0.0.1 -p "$preview_port" -R -t disableLeaveAlert=true \
   tmux attach-session -f read-only -t "$group_session" \
   > "${state_dir}/${group_session}-preview.log" 2>&1 < /dev/null &
 
-nohup ttyd -i 127.0.0.1 -p "$detail_port" -t disableLeaveAlert=true \
+nohup ttyd -T xterm-direct -i 127.0.0.1 -p "$detail_port" -t disableLeaveAlert=true \
   tmux attach-session -t "$group_session" \
   > "${state_dir}/${group_session}-detail.log" 2>&1 < /dev/null &
 

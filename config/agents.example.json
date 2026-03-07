@@ -3,6 +3,13 @@
     "title": "Agent Watch",
     "subtitle": "Private ttyd dashboard for live agent sessions"
   },
+  "monitor": {
+    "pollMs": 1000,
+    "activeWindowMs": 5000,
+    "syncWindowMs": 5000,
+    "settleWindowMs": 1000,
+    "ignoredBottomRows": 1
+  },
   "agents": [
     {
       "id": "alpha",

@@ -10,6 +10,14 @@ const configStatus = document.querySelector('#config-status');
 const configReloadButton = document.querySelector('#config-reload');
 const configSaveButton = document.querySelector('#config-save');
 const agentOrderStorageKey = 'agent-watch.agent-order';
+const inactiveAlertCooldownMs = 1200;
+const defaultMonitorConfig = Object.freeze({
+  pollMs: 1000,
+  activeWindowMs: 5000,
+  syncWindowMs: 5000,
+  settleWindowMs: 1000,
+  ignoredBottomRows: 1
+});
 
 let route = getRoute(window.location.pathname);
 
@@ -17,6 +25,16 @@ const state = {
   config: null,
   activeHomeAgentId: null,
   configModalOpen: false,
+  activity: {
+    intervalId: null,
+    byAgent: new Map(),
+    statusByAgent: new Map()
+  },
+  audio: {
+    context: null,
+    armed: false,
+    lastPlayedAt: 0
+  },
   drag: {
     agentId: null,
     targetId: null,
@@ -83,6 +101,7 @@ async function boot() {
 function initializeViews(config) {
   app.textContent = '';
   state.activeHomeAgentId = null;
+  stopActivityMonitor();
   state.views.empty = null;
   state.views.home = null;
   state.views.notFound = null;
@@ -102,6 +121,7 @@ function initializeViews(config) {
   `);
   bindHomeTerminals(state.views.home);
   app.append(state.views.home);
+  startActivityMonitor();
 }
 
 function renderCurrentRoute() {
@@ -146,7 +166,7 @@ function renderShell(config, routeAgent) {
   document.title = routeAgent ? `${routeAgent.name} · ${config.site.title}` : config.site.title;
 
   const links = [
-    { href: '/', label: 'Home', active: route.kind === 'home' },
+    { href: '/', label: '🏠', active: route.kind === 'home', ariaLabel: 'Home' },
     ...config.agents.map((agent) => ({
       href: `/agents/${agent.id}`,
       label: agent.name,
@@ -163,6 +183,7 @@ function renderShell(config, routeAgent) {
         <a
           class="nav-link ${link.active ? 'is-active' : ''} ${link.draggable ? 'is-draggable' : ''}"
           href="${link.href}"
+          ${link.ariaLabel ? `aria-label="${escapeAttr(link.ariaLabel)}" title="${escapeAttr(link.ariaLabel)}"` : ''}
           ${link.draggable ? `draggable="true" data-nav-agent-id="${escapeAttr(link.agentId)}"` : ''}
           ${link.accent ? `style="--agent-accent:${escapeAttr(link.accent)}"` : ''}
         >
@@ -171,6 +192,8 @@ function renderShell(config, routeAgent) {
       `
     )
     .join('');
+
+  syncNavActivityStatuses();
 }
 
 function ensureNotFoundView(agentId) {
@@ -243,6 +266,7 @@ function renderPreviewCard(agent) {
           <div class="agent-card__title-row">
             <h3>${escapeHtml(agent.name)}</h3>
             ${badge}
+            <span class="agent-status is-syncing" data-agent-status>Syncing</span>
             <p class="agent-card__meta agent-card__meta--inline">${escapeHtml(agent.description || 'No description set')}</p>
           </div>
         </div>
@@ -319,6 +343,8 @@ function handleDocumentClick(event) {
   if (!(event.target instanceof Element)) {
     return;
   }
+
+  armInactiveAlertAudio();
 
   if (state.configModalOpen) {
     return;
@@ -404,6 +430,8 @@ function handleConfigModalClick(event) {
 }
 
 function handleDocumentKeydown(event) {
+  armInactiveAlertAudio();
+
   if (event.key === 'Escape' && state.configModalOpen) {
     event.preventDefault();
     closeConfigModal();
@@ -749,13 +777,16 @@ function reconnectHomeTerminals() {
   for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
     const frame = terminal.querySelector('[data-home-terminal-frame]');
     const detailPath = terminal.dataset.detailPath;
+    const { agentId } = terminal.dataset;
     const card = terminal.closest('[data-agent-card]');
-    if (!(frame instanceof HTMLIFrameElement) || !detailPath || !card) {
+    if (!(frame instanceof HTMLIFrameElement) || !detailPath || !card || !agentId) {
       continue;
     }
 
     if (frame.getAttribute('src') !== detailPath) {
       frame.src = detailPath;
+      state.activity.byAgent.delete(agentId);
+      setAgentActivityStatus(card, 'syncing');
     }
 
     card.classList.toggle('is-live', terminal.dataset.agentId === state.activeHomeAgentId);
@@ -813,6 +844,256 @@ function bindHomeTerminals(homeView) {
       }
     });
   }
+}
+
+function startActivityMonitor() {
+  stopActivityMonitor();
+  updateHomeActivityStatuses();
+  state.activity.intervalId = window.setInterval(updateHomeActivityStatuses, getMonitorConfig().pollMs);
+}
+
+function stopActivityMonitor() {
+  if (state.activity.intervalId !== null) {
+    window.clearInterval(state.activity.intervalId);
+    state.activity.intervalId = null;
+  }
+
+  state.activity.byAgent.clear();
+  state.activity.statusByAgent.clear();
+}
+
+function updateHomeActivityStatuses() {
+  const homeView = state.views.home;
+  if (!homeView) {
+    return;
+  }
+
+  const now = Date.now();
+  const monitor = getMonitorConfig();
+  let shouldPlayInactiveAlert = false;
+
+  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
+    const frame = terminal.querySelector('[data-home-terminal-frame]');
+    const card = terminal.closest('[data-agent-card]');
+    const { agentId } = terminal.dataset;
+    if (!(frame instanceof HTMLIFrameElement) || !card || !agentId) {
+      continue;
+    }
+
+    const signature = readVisibleTerminalSignature(frame);
+    const previous = state.activity.byAgent.get(agentId);
+    if (signature === null) {
+      if (!previous) {
+        setAgentActivityStatus(card, 'syncing');
+      }
+      continue;
+    }
+
+    const nextState = previous
+      ? { ...previous }
+      : {
+          signature,
+          lastChangedAt: null,
+          syncChangedAt: null,
+          syncSawChange: false,
+          syncStableSince: now,
+          syncSettledAt: null,
+          status: 'syncing',
+          syncUntil: now + monitor.syncWindowMs
+        };
+
+    if (nextState.signature !== signature) {
+      nextState.signature = signature;
+      if (nextState.syncUntil) {
+        nextState.syncStableSince = now;
+        if (nextState.syncSettledAt) {
+          nextState.syncChangedAt = now;
+        } else {
+          nextState.syncSawChange = true;
+        }
+      } else {
+        nextState.lastChangedAt = now;
+      }
+    } else if (nextState.syncUntil && !nextState.syncSettledAt && now - nextState.syncStableSince >= monitor.settleWindowMs) {
+      nextState.syncSettledAt = now;
+    }
+
+    if (nextState.syncUntil && now < nextState.syncUntil) {
+      nextState.status = 'syncing';
+      state.activity.byAgent.set(agentId, nextState);
+      setAgentActivityStatus(card, nextState.status);
+      continue;
+    }
+
+    if (nextState.syncUntil) {
+      nextState.lastChangedAt = nextState.syncSettledAt
+        ? nextState.syncChangedAt
+        : (nextState.syncSawChange ? nextState.syncStableSince : null);
+      nextState.syncChangedAt = null;
+      nextState.syncSawChange = false;
+      nextState.syncStableSince = null;
+      nextState.syncSettledAt = null;
+      nextState.syncUntil = null;
+    }
+
+    nextState.status = nextState.lastChangedAt && now - nextState.lastChangedAt <= monitor.activeWindowMs
+      ? 'active'
+      : 'waiting';
+    shouldPlayInactiveAlert ||= previous?.status === 'active' && nextState.status === 'waiting';
+    state.activity.byAgent.set(agentId, nextState);
+    setAgentActivityStatus(card, nextState.status);
+  }
+
+  if (shouldPlayInactiveAlert) {
+    playInactiveAlertSound();
+  }
+}
+
+function getMonitorConfig() {
+  return state.config?.monitor || defaultMonitorConfig;
+}
+
+function readVisibleTerminalSignature(frame) {
+  try {
+    const term = frame.contentWindow?.term;
+    const activeBuffer = term?.buffer?.active;
+    const rows = Number(term?.rows || 0);
+    if (!activeBuffer || rows < 1 || typeof activeBuffer.getLine !== 'function') {
+      return null;
+    }
+
+    const { ignoredBottomRows } = getMonitorConfig();
+    const startRow = Number(activeBuffer.viewportY ?? activeBuffer.baseY ?? 0);
+    const visibleRowCount = Math.max(rows - ignoredBottomRows, 1);
+    const lines = [];
+
+    for (let row = 0; row < visibleRowCount; row += 1) {
+      const line = activeBuffer.getLine(startRow + row);
+      if (!line || typeof line.translateToString !== 'function') {
+        lines.push('');
+        continue;
+      }
+
+      lines.push(line.translateToString(true));
+    }
+
+    return lines.join('\n');
+  } catch {
+    return null;
+  }
+}
+
+function setAgentActivityStatus(card, status) {
+  const agentId = card.dataset.agentCard || '';
+  const label = card.querySelector('[data-agent-status]');
+  const nextText = {
+    active: 'Active',
+    waiting: 'Waiting',
+    syncing: 'Syncing'
+  }[status] || 'Syncing';
+
+  if (agentId) {
+    state.activity.statusByAgent.set(agentId, status);
+    setNavAgentActivityStatus(agentId, status);
+  }
+
+  card.classList.toggle('is-status-active', status === 'active');
+  card.classList.toggle('is-status-waiting', status === 'waiting');
+  card.classList.toggle('is-status-syncing', status === 'syncing');
+
+  if (!(label instanceof HTMLElement)) {
+    return;
+  }
+
+  label.textContent = nextText;
+  label.classList.toggle('is-active', status === 'active');
+  label.classList.toggle('is-waiting', status === 'waiting');
+  label.classList.toggle('is-syncing', status === 'syncing');
+}
+
+function syncNavActivityStatuses() {
+  for (const agent of state.config?.agents || []) {
+    const status = state.activity.statusByAgent.get(agent.id);
+    setNavAgentActivityStatus(agent.id, status || null);
+  }
+}
+
+function setNavAgentActivityStatus(agentId, status) {
+  const link = nav.querySelector(`[data-nav-agent-id="${CSS.escape(agentId)}"]`);
+  if (!(link instanceof HTMLElement)) {
+    return;
+  }
+
+  link.classList.toggle('is-status-active', status === 'active');
+  link.classList.toggle('is-status-waiting', status === 'waiting');
+  link.classList.toggle('is-status-syncing', status === 'syncing');
+
+  if (status) {
+    link.dataset.agentStatus = status;
+  } else {
+    delete link.dataset.agentStatus;
+  }
+}
+
+function armInactiveAlertAudio() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return;
+  }
+
+  if (!state.audio.context) {
+    state.audio.context = new AudioContextClass();
+  }
+
+  const context = state.audio.context;
+  if (!context) {
+    return;
+  }
+
+  if (context.state === 'running') {
+    state.audio.armed = true;
+    return;
+  }
+
+  context.resume()
+    .then(() => {
+      state.audio.armed = context.state === 'running';
+    })
+    .catch(() => {});
+}
+
+function playInactiveAlertSound() {
+  armInactiveAlertAudio();
+
+  const context = state.audio.context;
+  if (!context || context.state !== 'running' || !state.audio.armed) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  if (nowMs - state.audio.lastPlayedAt < inactiveAlertCooldownMs) {
+    return;
+  }
+
+  state.audio.lastPlayedAt = nowMs;
+
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  const startAt = context.currentTime;
+  const endAt = startAt + 0.18;
+
+  oscillator.type = 'triangle';
+  oscillator.frequency.setValueAtTime(880, startAt);
+  oscillator.frequency.exponentialRampToValueAtTime(660, endAt);
+
+  gain.gain.setValueAtTime(0.0001, startAt);
+  gain.gain.exponentialRampToValueAtTime(0.026, startAt + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
+
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(startAt);
+  oscillator.stop(endAt);
 }
 
 function prepareRouteView(view, type) {

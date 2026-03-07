@@ -18,6 +18,30 @@ const configPath = process.env.AGENT_WATCH_CONFIG || path.join(rootDir, 'config'
 const port = Number.parseInt(process.env.PORT || '3443', 10);
 const host = process.env.HOST || '0.0.0.0';
 const httpOnly = process.env.HTTP_ONLY === '1';
+const warpSolarizedDarkThemeLiteral = [
+  'theme:{',
+  'foreground:"#f8f8f2",',
+  'background:"#002b36",',
+  'cursor:"#f8f8f2",',
+  'selectionBackground:"rgba(147, 161, 161, 0.28)",',
+  'black:"#073642",',
+  'red:"#dc322f",',
+  'green:"#859900",',
+  'yellow:"#b58900",',
+  'blue:"#268bd2",',
+  'magenta:"#d33682",',
+  'cyan:"#2aa198",',
+  'white:"#eee8d5",',
+  'brightBlack:"#002b36",',
+  'brightRed:"#cb4b16",',
+  'brightGreen:"#586e75",',
+  'brightYellow:"#657b83",',
+  'brightBlue:"#839496",',
+  'brightMagenta:"#6c71c4",',
+  'brightCyan:"#93a1a1",',
+  'brightWhite:"#fdf6e3"',
+  '}'
+].join('');
 const terminalUnloadPatch = [
   '<script data-agent-watch="disable-unload-warning">',
   '(() => {',
@@ -42,6 +66,52 @@ const terminalUnloadPatch = [
   '      set() {}',
   '    });',
   '    window.onbeforeunload = null;',
+  '  } catch {}',
+  '  try {',
+  '    const terminalTheme = {',
+  '      foreground: "#f8f8f2",',
+  '      background: "#002b36",',
+  '      cursor: "#f8f8f2",',
+  '      selectionBackground: "rgba(147, 161, 161, 0.28)",',
+  '      black: "#073642",',
+  '      red: "#dc322f",',
+  '      green: "#859900",',
+  '      yellow: "#b58900",',
+  '      blue: "#268bd2",',
+  '      magenta: "#d33682",',
+  '      cyan: "#2aa198",',
+  '      white: "#eee8d5",',
+  '      brightBlack: "#002b36",',
+  '      brightRed: "#cb4b16",',
+  '      brightGreen: "#586e75",',
+  '      brightYellow: "#657b83",',
+  '      brightBlue: "#839496",',
+  '      brightMagenta: "#6c71c4",',
+  '      brightCyan: "#93a1a1",',
+  '      brightWhite: "#fdf6e3"',
+  '    };',
+  '    const applyTerminalTheme = () => {',
+  '      const term = window.term;',
+  '      if (!term || typeof term.setOption !== "function") return false;',
+  '      term.setOption("theme", terminalTheme);',
+  '      if (term.element) {',
+  '        term.element.style.backgroundColor = terminalTheme.background;',
+  '        term.element.style.color = terminalTheme.foreground;',
+  '      }',
+  '      document.documentElement.style.backgroundColor = terminalTheme.background;',
+  '      document.body.style.backgroundColor = terminalTheme.background;',
+  '      document.body.style.color = terminalTheme.foreground;',
+  '      return true;',
+  '    };',
+  '    if (!applyTerminalTheme()) {',
+  '      let attempts = 0;',
+  '      const timer = window.setInterval(() => {',
+  '        attempts += 1;',
+  '        if (applyTerminalTheme() || attempts > 80) {',
+  '          window.clearInterval(timer);',
+  '        }',
+  '      }, 100);',
+  '    }',
   '  } catch {}',
   '})();',
   '</script>'
@@ -241,6 +311,7 @@ function loadConfig() {
 function buildPublicConfig(config) {
   return {
     site: config.site,
+    monitor: config.monitor,
     agents: config.agents.map((agent) => {
       const detailUpstream = getUpstream(agent, 'detail');
       return {
@@ -277,6 +348,22 @@ function validateAgents(agents) {
   }
 }
 
+function validateMonitorConfig(monitor) {
+  const entries = [
+    ['pollMs', monitor.pollMs],
+    ['activeWindowMs', monitor.activeWindowMs],
+    ['syncWindowMs', monitor.syncWindowMs],
+    ['settleWindowMs', monitor.settleWindowMs],
+    ['ignoredBottomRows', monitor.ignoredBottomRows]
+  ];
+
+  for (const [key, value] of entries) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`monitor.${key} must be a non-negative integer.`);
+    }
+  }
+}
+
 function readConfigFile() {
   if (!fs.existsSync(configPath)) {
     return {
@@ -295,6 +382,7 @@ function writeConfigFile(raw) {
   const serialized = `${JSON.stringify(
     {
       site: normalized.site,
+      monitor: normalized.monitor,
       agents: normalized.agents
     },
     null,
@@ -309,13 +397,16 @@ function writeConfigFile(raw) {
 function normalizeConfig(parsed) {
   const config = parsed && typeof parsed === 'object' ? parsed : {};
   const agents = Array.isArray(config.agents) ? config.agents : [];
+  const monitor = normalizeMonitorConfig(config.monitor);
   validateAgents(agents);
+  validateMonitorConfig(monitor);
 
   return {
     site: {
       title: config.site?.title || 'Agent Watch',
       subtitle: config.site?.subtitle || 'Private ttyd dashboard for live agent sessions'
     },
+    monitor,
     agents
   };
 }
@@ -326,7 +417,31 @@ function getDefaultConfig() {
       title: 'Agent Watch',
       subtitle: 'Private ttyd dashboard for live agent sessions'
     },
+    monitor: getDefaultMonitorConfig(),
     agents: []
+  };
+}
+
+function getDefaultMonitorConfig() {
+  return {
+    pollMs: 1000,
+    activeWindowMs: 5000,
+    syncWindowMs: 5000,
+    settleWindowMs: 1000,
+    ignoredBottomRows: 1
+  };
+}
+
+function normalizeMonitorConfig(parsedMonitor) {
+  const defaults = getDefaultMonitorConfig();
+  const monitor = parsedMonitor && typeof parsedMonitor === 'object' ? parsedMonitor : {};
+
+  return {
+    pollMs: monitor.pollMs ?? defaults.pollMs,
+    activeWindowMs: monitor.activeWindowMs ?? defaults.activeWindowMs,
+    syncWindowMs: monitor.syncWindowMs ?? defaults.syncWindowMs,
+    settleWindowMs: monitor.settleWindowMs ?? defaults.settleWindowMs,
+    ignoredBottomRows: monitor.ignoredBottomRows ?? defaults.ignoredBottomRows
   };
 }
 
@@ -386,9 +501,10 @@ function proxyTerminalRoot(req, res, upstream, agent) {
           return;
         }
 
-        const patchedBody = injectTerminalUnloadPatch(rawBody.toString('utf8'));
+        const patchedBody = patchTerminalHtml(rawBody.toString('utf8'));
         responseHeaders['content-length'] = String(Buffer.byteLength(patchedBody));
         responseHeaders['content-type'] = contentType || 'text/html; charset=utf-8';
+        responseHeaders['cache-control'] = 'no-store';
         res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
         res.end(patchedBody);
       });
@@ -422,16 +538,30 @@ function sanitizeProxyHeaders(headers) {
   return nextHeaders;
 }
 
-function injectTerminalUnloadPatch(html) {
-  if (html.includes('data-agent-watch="disable-unload-warning"')) {
-    return html;
+function patchTerminalHtml(html) {
+  const themedHtml = applyWarpTerminalTheme(html);
+
+  if (themedHtml.includes('data-agent-watch="disable-unload-warning"')) {
+    return themedHtml;
   }
 
-  if (html.includes('</head>')) {
-    return html.replace('</head>', `${terminalUnloadPatch}</head>`);
+  if (themedHtml.includes('</head>')) {
+    return themedHtml.replace('</head>', `${terminalUnloadPatch}</head>`);
   }
 
-  return `${terminalUnloadPatch}${html}`;
+  return `${terminalUnloadPatch}${themedHtml}`;
+}
+
+function applyWarpTerminalTheme(html) {
+  return html
+    .replace(/theme:\{\}/g, warpSolarizedDarkThemeLiteral)
+    .replace(/theme:\{[^}]*foreground:"#[0-9a-fA-F]{6}"[^}]*\}/g, warpSolarizedDarkThemeLiteral)
+    .replace(/rendererType:"webgl"/g, 'rendererType:"canvas"')
+    .replace(/\.xterm \.composition-view\{background:#000;color:#fff;/g, '.xterm .composition-view{background:#002b36;color:#f8f8f2;')
+    .replace(/\.xterm \.xterm-viewport\{background-color:#000;/g, '.xterm .xterm-viewport{background-color:#002b36;')
+    .replace(/body,html\{height:100%;margin:0;min-height:100%;overflow:hidden\}/g, 'body,html{height:100%;margin:0;min-height:100%;overflow:hidden;background:#002b36;color:#f8f8f2}')
+    .replace(/#terminal-container\{height:100%;margin:0 auto;padding:0;width:auto\}/g, '#terminal-container{height:100%;margin:0 auto;padding:0;width:auto;background:#002b36}')
+    .replace(/#terminal-container \.terminal\{height:calc\(100% - 10px\);padding:5px\}/g, '#terminal-container .terminal{height:calc(100% - 10px);padding:5px;background:#002b36}');
 }
 
 function getHttpsOptions() {

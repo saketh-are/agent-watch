@@ -119,7 +119,7 @@ start_ttyd() {
   stop_existing_pid "$pidfile"
 
   local -a cmd
-  cmd=(ttyd -i "$bind_host" -p "$port" -t disableLeaveAlert=true)
+  cmd=(ttyd -T xterm-direct -i "$bind_host" -p "$port" -t disableLeaveAlert=true)
   if [[ "$mode" == "detail" ]]; then
     :
   else
@@ -232,6 +232,10 @@ if [[ -z "$backend" ]]; then
 fi
 
 [[ "$backend" == "tmux" || "$backend" == "screen" ]] || fail '--backend must be tmux or screen.'
+
+if [[ "$backend" == "tmux" ]]; then
+  tmux set -ga terminal-features ',xterm-256color:RGB,xterm-direct:RGB'
+fi
 
 if (( ! dry_run )); then
   require_command ttyd

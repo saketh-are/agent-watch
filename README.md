@@ -44,6 +44,13 @@ The app generates a local self-signed certificate in `.local/certs/` if you do n
     "title": "Agent Watch",
     "subtitle": "Private ttyd dashboard for live agent sessions"
   },
+  "monitor": {
+    "pollMs": 1000,
+    "activeWindowMs": 5000,
+    "syncWindowMs": 5000,
+    "settleWindowMs": 1000,
+    "ignoredBottomRows": 1
+  },
   "agents": [
     {
       "id": "alpha",
@@ -64,6 +71,11 @@ The app generates a local self-signed certificate in `.local/certs/` if you do n
 
 Notes:
 
+- `monitor.pollMs` controls how often the home cards sample terminal activity.
+- `monitor.activeWindowMs` is how long a recent visible change keeps a card marked `Active`.
+- `monitor.syncWindowMs` keeps a card in `Syncing` after load/reconnect before activity detection starts.
+- `monitor.settleWindowMs` is how long terminal content must stay unchanged during sync before bootstrap redraws stop counting as startup noise.
+- `monitor.ignoredBottomRows` skips the last N terminal rows when comparing content, which is useful for byobu status bars.
 - `target` is the upstream `ttyd` URL for the full agent page.
 - `previewTarget` is optional. If omitted, previews use `target`.
 - `headers` is optional and gets forwarded to the upstream `ttyd` server.
@@ -74,14 +86,16 @@ Notes:
 One endpoint per agent:
 
 ```bash
-ttyd -p 7681 byobu attach -t agent-alpha
+tmux set -ga terminal-features ',xterm-256color:RGB,xterm-direct:RGB'
+ttyd -T xterm-direct -p 7681 byobu attach -t agent-alpha
 ```
 
 Separate preview and full-session endpoints:
 
 ```bash
-ttyd -p 7681 byobu attach -t agent-alpha
-ttyd -W -p 7682 byobu attach -t agent-alpha
+tmux set -ga terminal-features ',xterm-256color:RGB,xterm-direct:RGB'
+ttyd -T xterm-direct -p 7681 byobu attach -t agent-alpha
+ttyd -T xterm-direct -W -p 7682 byobu attach -t agent-alpha
 ```
 
 Then point `previewTarget` to the read-only endpoint and `target` to the interactive one.
