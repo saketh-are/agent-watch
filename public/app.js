@@ -17,6 +17,7 @@ boot().catch((error) => {
 });
 
 window.addEventListener('popstate', () => window.location.reload());
+app.addEventListener('click', handleAppClick);
 
 async function boot() {
   const response = await fetch('/api/config', { cache: 'no-store' });
@@ -103,7 +104,11 @@ function renderPreviewCard(agent) {
     : '';
 
   return `
-    <article class="agent-card" style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}">
+    <article
+      class="agent-card"
+      style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}"
+      data-agent-card="${escapeAttr(agent.id)}"
+    >
       <div class="agent-card__header">
         <div>
           <div class="agent-card__title-row">
@@ -117,15 +122,38 @@ function renderPreviewCard(agent) {
           <a class="agent-button" href="/agents/${agent.id}">Focus</a>
         </div>
       </div>
-      <div class="agent-card__terminal-wrap">
+      <div
+        class="agent-card__terminal-wrap"
+        data-home-terminal
+        data-agent-id="${escapeAttr(agent.id)}"
+        data-preview-path="${escapeAttr(agent.previewPath)}"
+        data-detail-path="${escapeAttr(agent.detailPath)}"
+      >
         <iframe
           class="terminal-frame terminal-frame--preview"
           src="${agent.previewPath}"
           title="Preview of ${escapeAttr(agent.name)}"
           loading="lazy"
+          data-terminal-frame
+          data-mode="preview"
           referrerpolicy="no-referrer"
         ></iframe>
-        <a class="terminal-overlay" href="/agents/${agent.id}" aria-label="Open ${escapeAttr(agent.name)}"></a>
+        <button
+          class="terminal-overlay terminal-overlay--activate"
+          type="button"
+          data-home-activate="${escapeAttr(agent.id)}"
+          aria-label="Enable editing for ${escapeAttr(agent.name)}"
+        >
+          <span class="terminal-overlay__hint">Click terminal to edit</span>
+        </button>
+        <button
+          class="terminal-live-toggle"
+          type="button"
+          data-home-deactivate="${escapeAttr(agent.id)}"
+          hidden
+        >
+          Preview only
+        </button>
       </div>
     </article>
   `;
@@ -176,6 +204,70 @@ function renderEmptySetup() {
       </ol>
     </section>
   `;
+}
+
+function handleAppClick(event) {
+  const activateControl = event.target.closest('[data-home-activate]');
+  if (activateControl) {
+    const { homeActivate: agentId } = activateControl.dataset;
+    if (!agentId) {
+      return;
+    }
+
+    activateHomeTerminal(agentId);
+    return;
+  }
+
+  const deactivateControl = event.target.closest('[data-home-deactivate]');
+  if (deactivateControl) {
+    const { homeDeactivate: agentId } = deactivateControl.dataset;
+    if (!agentId) {
+      return;
+    }
+
+    setHomeTerminalMode(agentId, 'preview');
+  }
+}
+
+function activateHomeTerminal(agentId) {
+  for (const terminal of app.querySelectorAll('[data-home-terminal]')) {
+    const mode = terminal.dataset.agentId === agentId ? 'detail' : 'preview';
+    setHomeTerminalState(terminal, mode);
+  }
+}
+
+function setHomeTerminalMode(agentId, mode) {
+  for (const terminal of app.querySelectorAll('[data-home-terminal]')) {
+    if (terminal.dataset.agentId === agentId) {
+      setHomeTerminalState(terminal, mode);
+      return;
+    }
+  }
+}
+
+function setHomeTerminalState(terminal, mode) {
+  const frame = terminal.querySelector('[data-terminal-frame]');
+  const activateControl = terminal.querySelector('[data-home-activate]');
+  const deactivateControl = terminal.querySelector('[data-home-deactivate]');
+  const card = terminal.closest('[data-agent-card]');
+
+  if (!frame || !activateControl || !deactivateControl || !card) {
+    return;
+  }
+
+  const targetPath = mode === 'detail' ? terminal.dataset.detailPath : terminal.dataset.previewPath;
+  if (!targetPath) {
+    return;
+  }
+
+  if (frame.dataset.mode !== mode) {
+    frame.src = targetPath;
+    frame.dataset.mode = mode;
+  }
+
+  card.classList.toggle('is-live', mode === 'detail');
+  activateControl.hidden = mode === 'detail';
+  deactivateControl.hidden = mode !== 'detail';
 }
 
 function getRoute(pathname) {
