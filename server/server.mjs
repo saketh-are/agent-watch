@@ -232,7 +232,7 @@ function buildPublicConfig(config) {
         description: agent.description || '',
         badge: agent.badge || '',
         accent: agent.accent || '#d06d32',
-        source: detailUpstream.host,
+        source: agent.sourceLabel || detailUpstream.host,
         previewPath: `/terminal/${encodeURIComponent(agent.id)}/preview/`,
         detailPath: `/terminal/${encodeURIComponent(agent.id)}/detail/`
       };

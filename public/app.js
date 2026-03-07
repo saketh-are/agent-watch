@@ -7,6 +7,7 @@ let route = getRoute(window.location.pathname);
 
 const state = {
   config: null,
+  activeHomeAgentId: null,
   views: {
     empty: null,
     home: null,
@@ -46,6 +47,7 @@ async function boot() {
 
 function initializeViews(config) {
   app.textContent = '';
+  state.activeHomeAgentId = null;
   state.views.empty = null;
   state.views.home = null;
   state.views.notFound = null;
@@ -90,11 +92,15 @@ function renderCurrentRoute() {
   }
 
   if (route.kind === 'agent') {
+    disconnectHomeTerminals();
+    connectDetailTerminal(routeAgent);
     showOnly(ensureDetailView(routeAgent));
     focusRouteTerminal();
     return;
   }
 
+  disconnectDetailTerminals();
+  reconnectHomeTerminals();
   showOnly(state.views.home);
   focusRouteTerminal();
 }
@@ -195,12 +201,12 @@ function renderPreviewCard(agent) {
       data-agent-card="${escapeAttr(agent.id)}"
     >
       <div class="agent-card__header">
-        <div>
+        <div class="agent-card__summary">
           <div class="agent-card__title-row">
             <h3>${escapeHtml(agent.name)}</h3>
             ${badge}
+            <p class="agent-card__meta agent-card__meta--inline">${escapeHtml(agent.description || 'No description set')}</p>
           </div>
-          <p class="agent-card__meta">${escapeHtml(agent.description || 'No description set')}</p>
         </div>
         <div class="agent-card__actions">
           <span class="agent-source">${escapeHtml(agent.source)}</span>
@@ -211,28 +217,14 @@ function renderPreviewCard(agent) {
         class="agent-card__terminal-wrap"
         data-home-terminal
         data-agent-id="${escapeAttr(agent.id)}"
-        data-preview-path="${escapeAttr(agent.previewPath)}"
         data-detail-path="${escapeAttr(agent.detailPath)}"
       >
         <iframe
           class="terminal-frame terminal-frame--preview"
-          src="${agent.previewPath}"
-          title="Preview of ${escapeAttr(agent.name)}"
-          data-terminal-preview-frame
-          referrerpolicy="no-referrer"
-        ></iframe>
-        <iframe
-          class="terminal-frame terminal-frame--preview terminal-frame--home-live"
           title="Interactive terminal for ${escapeAttr(agent.name)}"
-          data-terminal-detail-frame
+          data-home-terminal-frame
           referrerpolicy="no-referrer"
         ></iframe>
-        <button
-          class="terminal-overlay terminal-overlay--activate"
-          type="button"
-          data-home-activate="${escapeAttr(agent.id)}"
-          aria-label="Enable editing for ${escapeAttr(agent.name)}"
-        ></button>
       </div>
     </article>
   `;
@@ -262,8 +254,8 @@ function renderAgentDetail(agent) {
       <section class="detail-terminal">
         <iframe
           class="terminal-frame terminal-frame--detail"
-          src="${agent.detailPath}"
           title="Interactive terminal for ${escapeAttr(agent.name)}"
+          data-detail-path="${escapeAttr(agent.detailPath)}"
           referrerpolicy="no-referrer"
         ></iframe>
       </section>
@@ -290,19 +282,15 @@ function handleDocumentClick(event) {
     return;
   }
 
-  const activateControl = event.target.closest('[data-home-activate]');
-  if (activateControl) {
-    const { homeActivate: agentId } = activateControl.dataset;
-    if (agentId) {
-      activateHomeTerminal(agentId);
-    }
-    return;
-  }
-
   const link = event.target.closest('a[href]');
   if (!link || !shouldHandleNavigation(event, link)) {
     retainHomeTerminalFocus(event.target);
     return;
+  }
+
+  const card = link.closest('[data-agent-card]');
+  if (card?.dataset.agentCard) {
+    state.activeHomeAgentId = card.dataset.agentCard;
   }
 
   event.preventDefault();
@@ -348,81 +336,98 @@ function navigateTo(href) {
   renderCurrentRoute();
 }
 
-function activateHomeTerminal(agentId) {
+function disconnectHomeTerminals() {
   const homeView = state.views.home;
   if (!homeView) {
     return;
   }
 
   for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    const mode = terminal.dataset.agentId === agentId ? 'detail' : 'preview';
-    setHomeTerminalState(terminal, mode);
+    const frame = terminal.querySelector('[data-home-terminal-frame]');
+    const card = terminal.closest('[data-agent-card]');
+    if (!(frame instanceof HTMLIFrameElement) || !card) {
+      continue;
+    }
+
+    card.classList.remove('is-live');
+    if (frame.getAttribute('src')) {
+      frame.removeAttribute('src');
+    }
   }
 }
 
-function setHomeTerminalState(terminal, mode) {
-  const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
-  const activateControl = terminal.querySelector('[data-home-activate]');
-  const card = terminal.closest('[data-agent-card]');
-
-  if (!detailFrame || !activateControl || !card) {
+function reconnectHomeTerminals() {
+  const homeView = state.views.home;
+  if (!homeView) {
     return;
   }
 
-  terminal.dataset.mode = mode;
-
-  if (mode === 'detail' && detailFrame.dataset.ready !== 'true') {
+  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
+    const frame = terminal.querySelector('[data-home-terminal-frame]');
     const detailPath = terminal.dataset.detailPath;
-    if (detailPath && detailFrame.dataset.loading !== 'true') {
-      detailFrame.dataset.loading = 'true';
-      detailFrame.src = detailPath;
+    const card = terminal.closest('[data-agent-card]');
+    if (!(frame instanceof HTMLIFrameElement) || !detailPath || !card) {
+      continue;
+    }
+
+    if (frame.getAttribute('src') !== detailPath) {
+      frame.src = detailPath;
+    }
+
+    card.classList.toggle('is-live', terminal.dataset.agentId === state.activeHomeAgentId);
+  }
+}
+
+function disconnectDetailTerminals() {
+  for (const view of state.views.detailById.values()) {
+    const frame = view.querySelector('.terminal-frame--detail');
+    if (!(frame instanceof HTMLIFrameElement)) {
+      continue;
+    }
+
+    if (frame.getAttribute('src')) {
+      frame.removeAttribute('src');
     }
   }
+}
 
-  syncHomeTerminalState(terminal);
+function connectDetailTerminal(agent) {
+  const view = ensureDetailView(agent);
+  const frame = view.querySelector('.terminal-frame--detail');
+  if (!(frame instanceof HTMLIFrameElement)) {
+    return;
+  }
+
+  if (frame.getAttribute('src') !== agent.detailPath) {
+    frame.src = agent.detailPath;
+  }
 }
 
 function bindHomeTerminals(homeView) {
   for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    terminal.dataset.mode = 'preview';
-    const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
-    if (!detailFrame) {
+    const frame = terminal.querySelector('[data-home-terminal-frame]');
+    const card = terminal.closest('[data-agent-card]');
+    if (!(frame instanceof HTMLIFrameElement) || !card) {
       continue;
     }
 
-    detailFrame.addEventListener('load', () => {
-      if (detailFrame.dataset.loading !== 'true') {
+    frame.addEventListener('focus', () => {
+      const { agentId } = terminal.dataset;
+      if (!agentId) {
         return;
       }
-      detailFrame.dataset.ready = 'true';
-      detailFrame.dataset.loading = 'false';
-      syncHomeTerminalState(terminal);
-      if (route.kind === 'home' && terminal.dataset.mode === 'detail') {
-        focusTerminalFrame(detailFrame);
+
+      state.activeHomeAgentId = agentId;
+      for (const siblingCard of homeView.querySelectorAll('[data-agent-card]')) {
+        siblingCard.classList.toggle('is-live', siblingCard.dataset.agentCard === agentId);
       }
     });
-  }
-}
 
-function syncHomeTerminalState(terminal) {
-  const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
-  const activateControl = terminal.querySelector('[data-home-activate]');
-  const card = terminal.closest('[data-agent-card]');
-  if (!detailFrame || !activateControl || !card) {
-    return;
-  }
-
-  const wantsLive = terminal.dataset.mode === 'detail';
-  const detailReady = detailFrame.dataset.ready === 'true';
-
-  terminal.classList.toggle('is-activating', wantsLive && !detailReady);
-  terminal.classList.toggle('is-live', wantsLive && detailReady);
-  card.classList.toggle('is-activating', wantsLive && !detailReady);
-  card.classList.toggle('is-live', wantsLive);
-  activateControl.hidden = wantsLive;
-
-  if (wantsLive && detailReady && route.kind === 'home') {
-    focusTerminalFrame(detailFrame);
+    frame.addEventListener('load', () => {
+      if (route.kind === 'home' && terminal.dataset.agentId === state.activeHomeAgentId) {
+        focusTerminalFrame(frame);
+      }
+    });
   }
 }
 
@@ -446,7 +451,10 @@ function focusRouteTerminal() {
     return;
   }
 
-  const frame = state.views.home?.querySelector('.agent-card.is-live [data-terminal-detail-frame]');
+  const selector = state.activeHomeAgentId
+    ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
+    : null;
+  const frame = selector ? state.views.home?.querySelector(selector) : null;
   focusTerminalFrame(frame);
 }
 
@@ -459,7 +467,10 @@ function retainHomeTerminalFocus(target) {
     return;
   }
 
-  const frame = state.views.home?.querySelector('.agent-card.is-live [data-terminal-detail-frame]');
+  const selector = state.activeHomeAgentId
+    ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
+    : null;
+  const frame = selector ? state.views.home?.querySelector(selector) : null;
   if (!frame) {
     return;
   }
@@ -488,10 +499,17 @@ function focusTerminalFrame(frame) {
       const term = frame.contentWindow?.term;
       if (term && typeof term.focus === 'function') {
         term.focus();
+        if (typeof term.scrollToBottom === 'function') {
+          term.scrollToBottom();
+        }
         focused = true;
       }
 
       const doc = frame.contentDocument;
+      const viewport = doc?.querySelector('.xterm-viewport');
+      if (viewport instanceof HTMLElement) {
+        viewport.scrollTop = viewport.scrollHeight;
+      }
       const helper = doc?.querySelector('.xterm-helper-textarea');
       if (helper instanceof HTMLElement) {
         helper.focus({ preventScroll: true });

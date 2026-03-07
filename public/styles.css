@@ -285,6 +285,31 @@ body.route-agent .route-view--not-found.is-active {
   margin-bottom: 0.1rem;
 }
 
+.agent-card__summary {
+  min-width: 0;
+}
+
+.agent-card__header .agent-card__title-row {
+  flex-wrap: nowrap;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.agent-card__header h3 {
+  font-size: 1.02rem;
+  line-height: 1.05;
+  white-space: nowrap;
+}
+
+.agent-card__meta--inline {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  line-height: 1.2;
+}
+
 .detail-header__summary {
   min-width: 0;
 }
@@ -331,7 +356,18 @@ body.route-agent .route-view--not-found.is-active {
   font-size: 0.8rem;
 }
 
+.agent-card__header .agent-button {
+  min-height: 1.8rem;
+  padding: 0.34rem 0.72rem;
+  font-size: 0.8rem;
+}
+
 .detail-header .agent-source {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.7rem;
+}
+
+.agent-card__header .agent-source {
   padding: 0.2rem 0.4rem;
   font-size: 0.7rem;
 }

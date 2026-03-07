@@ -10,6 +10,7 @@
       "description": "Interactive agent session on vm-alpha",
       "badge": "prod",
       "accent": "#d06d32",
+      "sourceLabel": "10.0.0.11:7681",
       "target": "http://127.0.0.1:7681/",
       "previewTarget": "http://127.0.0.1:7681/"
     },
@@ -19,6 +20,7 @@
       "description": "Indexer and background jobs on vm-beta",
       "badge": "staging",
       "accent": "#2d7d6a",
+      "sourceLabel": "10.0.0.12:7682",
       "target": "http://127.0.0.1:7682/",
       "previewTarget": "http://127.0.0.1:7682/",
       "insecureSkipVerify": true,

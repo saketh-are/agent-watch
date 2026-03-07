@@ -128,7 +128,7 @@ start_ttyd() {
 
   if [[ "$backend" == "tmux" ]]; then
     if [[ "$mode" == "preview" ]]; then
-      cmd+=(tmux attach-session -r -t "$session_ref")
+      cmd+=(tmux attach-session -f read-only -t "$session_ref")
     else
       cmd+=(tmux attach-session -t "$session_ref")
     fi
