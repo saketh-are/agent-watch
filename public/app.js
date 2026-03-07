@@ -3,7 +3,17 @@ const nav = document.querySelector('#site-nav');
 const siteTitle = document.querySelector('#site-title');
 const siteSubtitle = document.querySelector('#site-subtitle');
 
-const route = getRoute(window.location.pathname);
+let route = getRoute(window.location.pathname);
+
+const state = {
+  config: null,
+  views: {
+    empty: null,
+    home: null,
+    notFound: null,
+    detailById: new Map()
+  }
+};
 
 boot().catch((error) => {
   console.error(error);
@@ -16,8 +26,12 @@ boot().catch((error) => {
   `;
 });
 
-window.addEventListener('popstate', () => window.location.reload());
-app.addEventListener('click', handleAppClick);
+window.addEventListener('popstate', () => {
+  route = getRoute(window.location.pathname);
+  renderCurrentRoute();
+});
+
+document.addEventListener('click', handleDocumentClick);
 
 async function boot() {
   const response = await fetch('/api/config', { cache: 'no-store' });
@@ -25,17 +39,70 @@ async function boot() {
     throw new Error(`Request failed with ${response.status}`);
   }
 
-  const config = await response.json();
-  renderShell(config);
-  renderPage(config);
+  state.config = await response.json();
+  initializeViews(state.config);
+  renderCurrentRoute();
 }
 
-function renderShell(config) {
+function initializeViews(config) {
+  app.textContent = '';
+  state.views.empty = null;
+  state.views.home = null;
+  state.views.notFound = null;
+  state.views.detailById.clear();
+
+  if (!config.agents.length) {
+    state.views.empty = htmlToElement(renderEmptySetup());
+    prepareRouteView(state.views.empty, 'empty');
+    app.append(state.views.empty);
+    return;
+  }
+
+  state.views.home = htmlToElement(`
+    <section class="stack route-view route-view--home is-active" data-route-view="home" aria-hidden="false">
+      ${config.agents.map(renderPreviewCard).join('')}
+    </section>
+  `);
+  bindHomeTerminals(state.views.home);
+  app.append(state.views.home);
+}
+
+function renderCurrentRoute() {
+  const config = state.config;
+  if (!config) {
+    return;
+  }
+
+  const routeAgent = config.agents.find((agent) => agent.id === route.agentId);
+  const isKnownAgentRoute = route.kind === 'agent' && Boolean(routeAgent);
+
+  renderShell(config, isKnownAgentRoute ? routeAgent : null);
+  document.body.classList.toggle('route-agent', isKnownAgentRoute);
+
+  if (!config.agents.length) {
+    showOnly(state.views.empty);
+    return;
+  }
+
+  if (route.kind === 'agent' && !routeAgent) {
+    showOnly(ensureNotFoundView(route.agentId));
+    return;
+  }
+
+  if (route.kind === 'agent') {
+    showOnly(ensureDetailView(routeAgent));
+    focusRouteTerminal();
+    return;
+  }
+
+  showOnly(state.views.home);
+  focusRouteTerminal();
+}
+
+function renderShell(config, routeAgent) {
   siteTitle.textContent = config.site.title;
   siteSubtitle.textContent = config.site.subtitle;
-  document.title = route.agent
-    ? `${route.agent.name || route.agentId} · ${config.site.title}`
-    : config.site.title;
+  document.title = routeAgent ? `${routeAgent.name} · ${config.site.title}` : config.site.title;
 
   const links = [
     { href: '/', label: 'Home', active: route.kind === 'home' },
@@ -62,40 +129,58 @@ function renderShell(config) {
     .join('');
 }
 
-function renderPage(config) {
-  const routeAgent = config.agents.find((agent) => agent.id === route.agentId);
-  const isAgentRoute = route.kind === 'agent' && Boolean(routeAgent);
-
-  document.body.classList.toggle('route-agent', isAgentRoute);
-
-  if (!config.agents.length) {
-    app.innerHTML = renderEmptySetup();
-    return;
-  }
-
-  if (route.kind === 'agent' && !routeAgent) {
-    app.innerHTML = `
-      <section class="empty-state">
+function ensureNotFoundView(agentId) {
+  if (!state.views.notFound) {
+    state.views.notFound = htmlToElement(`
+      <section class="empty-state route-view route-view--not-found is-inactive" data-route-view="not-found" aria-hidden="true">
         <p class="eyebrow">Unknown Agent</p>
-        <h2>No configured agent matches <code>${escapeHtml(route.agentId)}</code>.</h2>
+        <h2></h2>
         <p>Check <code>config/agents.json</code> and restart the server.</p>
       </section>
-    `;
-    return;
+    `);
+    app.append(state.views.notFound);
   }
 
-  if (route.kind === 'agent') {
-    route.agent = routeAgent;
-    document.title = `${routeAgent.name} · ${config.site.title}`;
-    app.innerHTML = renderAgentDetail(routeAgent);
-    return;
+  const heading = state.views.notFound.querySelector('h2');
+  if (heading) {
+    heading.innerHTML = `No configured agent matches <code>${escapeHtml(agentId || '')}</code>.`;
   }
 
-  app.innerHTML = `
-    <section class="stack">
-      ${config.agents.map(renderPreviewCard).join('')}
-    </section>
-  `;
+  return state.views.notFound;
+}
+
+function ensureDetailView(agent) {
+  let view = state.views.detailById.get(agent.id);
+  if (view) {
+    return view;
+  }
+
+  view = htmlToElement(renderAgentDetail(agent));
+  prepareRouteView(view, 'agent');
+  view.dataset.agentId = agent.id;
+  const detailFrame = view.querySelector('.terminal-frame--detail');
+  if (detailFrame instanceof HTMLIFrameElement) {
+    detailFrame.addEventListener('load', () => {
+      if (route.kind === 'agent' && route.agentId === agent.id) {
+        focusTerminalFrame(detailFrame);
+      }
+    });
+  }
+  app.append(view);
+  state.views.detailById.set(agent.id, view);
+  return view;
+}
+
+function showOnly(activeView) {
+  const views = [state.views.empty, state.views.home, state.views.notFound, ...state.views.detailById.values()];
+  for (const view of views) {
+    if (view) {
+      const isActive = view === activeView;
+      view.classList.toggle('is-active', isActive);
+      view.classList.toggle('is-inactive', !isActive);
+      view.setAttribute('aria-hidden', String(!isActive));
+    }
+  }
 }
 
 function renderPreviewCard(agent) {
@@ -133,9 +218,13 @@ function renderPreviewCard(agent) {
           class="terminal-frame terminal-frame--preview"
           src="${agent.previewPath}"
           title="Preview of ${escapeAttr(agent.name)}"
-          loading="lazy"
-          data-terminal-frame
-          data-mode="preview"
+          data-terminal-preview-frame
+          referrerpolicy="no-referrer"
+        ></iframe>
+        <iframe
+          class="terminal-frame terminal-frame--preview terminal-frame--home-live"
+          title="Interactive terminal for ${escapeAttr(agent.name)}"
+          data-terminal-detail-frame
           referrerpolicy="no-referrer"
         ></iframe>
         <button
@@ -143,17 +232,7 @@ function renderPreviewCard(agent) {
           type="button"
           data-home-activate="${escapeAttr(agent.id)}"
           aria-label="Enable editing for ${escapeAttr(agent.name)}"
-        >
-          <span class="terminal-overlay__hint">Click terminal to edit</span>
-        </button>
-        <button
-          class="terminal-live-toggle"
-          type="button"
-          data-home-deactivate="${escapeAttr(agent.id)}"
-          hidden
-        >
-          Preview only
-        </button>
+        ></button>
       </div>
     </article>
   `;
@@ -165,7 +244,7 @@ function renderAgentDetail(agent) {
     : '';
 
   return `
-    <section class="detail-page">
+    <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
       <section class="detail-header" style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}">
         <div class="detail-header__summary">
           <div class="detail-header__title-row">
@@ -206,68 +285,233 @@ function renderEmptySetup() {
   `;
 }
 
-function handleAppClick(event) {
-  const activateControl = event.target.closest('[data-home-activate]');
-  if (activateControl) {
-    const { homeActivate: agentId } = activateControl.dataset;
-    if (!agentId) {
-      return;
-    }
-
-    activateHomeTerminal(agentId);
+function handleDocumentClick(event) {
+  if (!(event.target instanceof Element)) {
     return;
   }
 
-  const deactivateControl = event.target.closest('[data-home-deactivate]');
-  if (deactivateControl) {
-    const { homeDeactivate: agentId } = deactivateControl.dataset;
-    if (!agentId) {
-      return;
+  const activateControl = event.target.closest('[data-home-activate]');
+  if (activateControl) {
+    const { homeActivate: agentId } = activateControl.dataset;
+    if (agentId) {
+      activateHomeTerminal(agentId);
     }
-
-    setHomeTerminalMode(agentId, 'preview');
+    return;
   }
+
+  const link = event.target.closest('a[href]');
+  if (!link || !shouldHandleNavigation(event, link)) {
+    retainHomeTerminalFocus(event.target);
+    return;
+  }
+
+  event.preventDefault();
+  navigateTo(link.href);
+}
+
+function shouldHandleNavigation(event, link) {
+  if (event.defaultPrevented || event.button !== 0) {
+    return false;
+  }
+
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+    return false;
+  }
+
+  if (link.target && link.target !== '_self') {
+    return false;
+  }
+
+  if (link.hasAttribute('download')) {
+    return false;
+  }
+
+  const url = new URL(link.href, window.location.origin);
+  if (url.origin !== window.location.origin) {
+    return false;
+  }
+
+  return url.pathname === '/' || /^\/agents\/[^/]+\/?$/.test(url.pathname);
+}
+
+function navigateTo(href) {
+  const url = new URL(href, window.location.origin);
+  const nextPath = `${url.pathname}${url.search}${url.hash}`;
+  const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+
+  if (nextPath === currentPath) {
+    return;
+  }
+
+  history.pushState({}, '', nextPath);
+  route = getRoute(url.pathname);
+  renderCurrentRoute();
 }
 
 function activateHomeTerminal(agentId) {
-  for (const terminal of app.querySelectorAll('[data-home-terminal]')) {
+  const homeView = state.views.home;
+  if (!homeView) {
+    return;
+  }
+
+  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
     const mode = terminal.dataset.agentId === agentId ? 'detail' : 'preview';
     setHomeTerminalState(terminal, mode);
   }
 }
 
-function setHomeTerminalMode(agentId, mode) {
-  for (const terminal of app.querySelectorAll('[data-home-terminal]')) {
-    if (terminal.dataset.agentId === agentId) {
-      setHomeTerminalState(terminal, mode);
-      return;
+function setHomeTerminalState(terminal, mode) {
+  const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
+  const activateControl = terminal.querySelector('[data-home-activate]');
+  const card = terminal.closest('[data-agent-card]');
+
+  if (!detailFrame || !activateControl || !card) {
+    return;
+  }
+
+  terminal.dataset.mode = mode;
+
+  if (mode === 'detail' && detailFrame.dataset.ready !== 'true') {
+    const detailPath = terminal.dataset.detailPath;
+    if (detailPath && detailFrame.dataset.loading !== 'true') {
+      detailFrame.dataset.loading = 'true';
+      detailFrame.src = detailPath;
     }
+  }
+
+  syncHomeTerminalState(terminal);
+}
+
+function bindHomeTerminals(homeView) {
+  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
+    terminal.dataset.mode = 'preview';
+    const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
+    if (!detailFrame) {
+      continue;
+    }
+
+    detailFrame.addEventListener('load', () => {
+      if (detailFrame.dataset.loading !== 'true') {
+        return;
+      }
+      detailFrame.dataset.ready = 'true';
+      detailFrame.dataset.loading = 'false';
+      syncHomeTerminalState(terminal);
+      if (route.kind === 'home' && terminal.dataset.mode === 'detail') {
+        focusTerminalFrame(detailFrame);
+      }
+    });
   }
 }
 
-function setHomeTerminalState(terminal, mode) {
-  const frame = terminal.querySelector('[data-terminal-frame]');
+function syncHomeTerminalState(terminal) {
+  const detailFrame = terminal.querySelector('[data-terminal-detail-frame]');
   const activateControl = terminal.querySelector('[data-home-activate]');
-  const deactivateControl = terminal.querySelector('[data-home-deactivate]');
   const card = terminal.closest('[data-agent-card]');
-
-  if (!frame || !activateControl || !deactivateControl || !card) {
+  if (!detailFrame || !activateControl || !card) {
     return;
   }
 
-  const targetPath = mode === 'detail' ? terminal.dataset.detailPath : terminal.dataset.previewPath;
-  if (!targetPath) {
+  const wantsLive = terminal.dataset.mode === 'detail';
+  const detailReady = detailFrame.dataset.ready === 'true';
+
+  terminal.classList.toggle('is-activating', wantsLive && !detailReady);
+  terminal.classList.toggle('is-live', wantsLive && detailReady);
+  card.classList.toggle('is-activating', wantsLive && !detailReady);
+  card.classList.toggle('is-live', wantsLive);
+  activateControl.hidden = wantsLive;
+
+  if (wantsLive && detailReady && route.kind === 'home') {
+    focusTerminalFrame(detailFrame);
+  }
+}
+
+function prepareRouteView(view, type) {
+  view.classList.add('route-view', `route-view--${type}`);
+  view.classList.add('is-inactive');
+  view.setAttribute('aria-hidden', 'true');
+}
+
+function htmlToElement(markup) {
+  const template = document.createElement('template');
+  template.innerHTML = markup.trim();
+  return template.content.firstElementChild;
+}
+
+function focusRouteTerminal() {
+  if (route.kind === 'agent') {
+    const activeView = state.views.detailById.get(route.agentId);
+    const frame = activeView?.querySelector('.terminal-frame--detail');
+    focusTerminalFrame(frame);
     return;
   }
 
-  if (frame.dataset.mode !== mode) {
-    frame.src = targetPath;
-    frame.dataset.mode = mode;
+  const frame = state.views.home?.querySelector('.agent-card.is-live [data-terminal-detail-frame]');
+  focusTerminalFrame(frame);
+}
+
+function retainHomeTerminalFocus(target) {
+  if (route.kind !== 'home' || !(target instanceof Element)) {
+    return;
   }
 
-  card.classList.toggle('is-live', mode === 'detail');
-  activateControl.hidden = mode === 'detail';
-  deactivateControl.hidden = mode !== 'detail';
+  if (target.closest('[data-home-terminal]')) {
+    return;
+  }
+
+  const frame = state.views.home?.querySelector('.agent-card.is-live [data-terminal-detail-frame]');
+  if (!frame) {
+    return;
+  }
+
+  requestAnimationFrame(() => focusTerminalFrame(frame));
+}
+
+function focusTerminalFrame(frame) {
+  if (!(frame instanceof HTMLIFrameElement)) {
+    return;
+  }
+
+  let attempts = 0;
+
+  const tryFocus = () => {
+    if (!frame.isConnected) {
+      return;
+    }
+
+    let focused = false;
+
+    try {
+      frame.focus();
+      frame.contentWindow?.focus();
+
+      const term = frame.contentWindow?.term;
+      if (term && typeof term.focus === 'function') {
+        term.focus();
+        focused = true;
+      }
+
+      const doc = frame.contentDocument;
+      const helper = doc?.querySelector('.xterm-helper-textarea');
+      if (helper instanceof HTMLElement) {
+        helper.focus({ preventScroll: true });
+        focused = true;
+      } else {
+        const xterm = doc?.querySelector('.xterm');
+        if (xterm instanceof HTMLElement) {
+          xterm.focus({ preventScroll: true });
+          focused = true;
+        }
+      }
+    } catch {}
+
+    attempts += 1;
+    if (attempts < 12) {
+      setTimeout(tryFocus, focused ? 40 : 120);
+    }
+  };
+
+  requestAnimationFrame(tryFocus);
 }
 
 function getRoute(pathname) {
