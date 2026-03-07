@@ -33,6 +33,11 @@ body {
   min-height: 100vh;
 }
 
+body.route-agent {
+  height: 100dvh;
+  overflow: hidden;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -50,6 +55,12 @@ code {
   max-width: none;
   margin: 0 auto;
   padding: 0.5rem;
+}
+
+body.route-agent .app-shell {
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .ambient {
@@ -167,15 +178,30 @@ h3 {
   gap: 0.45rem;
 }
 
+body.route-agent .app-root {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .detail-header,
 .empty-state {
   display: grid;
-  gap: 0.55rem;
-  padding: 0.8rem;
-  border-radius: 1rem;
   background: var(--panel-strong);
   border: 1px solid rgba(255, 255, 255, 0.72);
   box-shadow: var(--shadow);
+}
+
+.detail-header {
+  gap: 0.35rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.8rem;
+}
+
+.empty-state {
+  gap: 0.55rem;
+  padding: 0.8rem;
+  border-radius: 1rem;
 }
 
 .stack {
@@ -220,6 +246,15 @@ h3 {
   margin-bottom: 0.1rem;
 }
 
+.detail-header__summary {
+  min-width: 0;
+}
+
+.detail-header__summary h2 {
+  font-size: 1.02rem;
+  line-height: 1.05;
+}
+
 .agent-badge,
 .agent-source {
   display: inline-flex;
@@ -251,14 +286,39 @@ h3 {
   font-size: 0.86rem;
 }
 
+.detail-header .agent-button {
+  min-height: 1.8rem;
+  padding: 0.34rem 0.72rem;
+  font-size: 0.8rem;
+}
+
+.detail-header .agent-source {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.7rem;
+}
+
 .agent-button--secondary {
   background: rgba(24, 32, 39, 0.08);
   color: var(--ink);
 }
 
 .agent-card__terminal-wrap,
+.detail-page,
 .detail-terminal {
   position: relative;
+}
+
+.detail-page {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0.45rem;
+  height: 100%;
+  min-height: 0;
+}
+
+.agent-card__terminal-wrap,
+.detail-terminal {
+  min-height: 0;
   overflow: hidden;
   border-radius: 0.8rem;
   background: var(--terminal-bg);
@@ -280,7 +340,9 @@ h3 {
 }
 
 .terminal-frame--detail {
-  min-height: calc(100vh - 8.2rem);
+  display: block;
+  height: 100%;
+  min-height: 0;
 }
 
 .terminal-overlay {
@@ -304,10 +366,6 @@ h3 {
   .detail-header__actions {
     justify-content: space-between;
     flex-wrap: wrap;
-  }
-
-  .terminal-frame--detail {
-    min-height: calc(100vh - 9.5rem);
   }
 }
 

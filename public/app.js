@@ -63,6 +63,9 @@ function renderShell(config) {
 
 function renderPage(config) {
   const routeAgent = config.agents.find((agent) => agent.id === route.agentId);
+  const isAgentRoute = route.kind === 'agent' && Boolean(routeAgent);
+
+  document.body.classList.toggle('route-agent', isAgentRoute);
 
   if (!config.agents.length) {
     app.innerHTML = renderEmptySetup();
@@ -134,29 +137,29 @@ function renderAgentDetail(agent) {
     : '';
 
   return `
-    <section class="detail-header" style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}">
-      <div>
-        <p class="eyebrow">Agent View</p>
-        <div class="detail-header__title-row">
-          <h2>${escapeHtml(agent.name)}</h2>
-          ${badge}
+    <section class="detail-page">
+      <section class="detail-header" style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}">
+        <div class="detail-header__summary">
+          <div class="detail-header__title-row">
+            <h2>${escapeHtml(agent.name)}</h2>
+            ${badge}
+          </div>
         </div>
-        <p class="detail-header__meta">${escapeHtml(agent.description || 'No description set')}</p>
-      </div>
-      <div class="detail-header__actions">
-        <span class="agent-source">${escapeHtml(agent.source)}</span>
-        <a class="agent-button agent-button--secondary" href="${agent.detailPath}" target="_blank" rel="noreferrer">
-          Open terminal only
-        </a>
-      </div>
-    </section>
-    <section class="detail-terminal">
-      <iframe
-        class="terminal-frame terminal-frame--detail"
-        src="${agent.detailPath}"
-        title="Interactive terminal for ${escapeAttr(agent.name)}"
-        referrerpolicy="no-referrer"
-      ></iframe>
+        <div class="detail-header__actions">
+          <span class="agent-source">${escapeHtml(agent.source)}</span>
+          <a class="agent-button agent-button--secondary" href="${agent.detailPath}" target="_blank" rel="noreferrer">
+            Open terminal only
+          </a>
+        </div>
+      </section>
+      <section class="detail-terminal">
+        <iframe
+          class="terminal-frame terminal-frame--detail"
+          src="${agent.detailPath}"
+          title="Interactive terminal for ${escapeAttr(agent.name)}"
+          referrerpolicy="no-referrer"
+        ></iframe>
+      </section>
     </section>
   `;
 }
