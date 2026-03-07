@@ -38,11 +38,11 @@ pkill -f "ttyd -i 127.0.0.1 -p ${preview_port} " || true
 pkill -f "ttyd -i 127.0.0.1 -p ${detail_port} " || true
 sleep 0.5
 
-nohup ttyd -i 127.0.0.1 -p "$preview_port" -t disableLeaveAlert=true \
+nohup ttyd -i 127.0.0.1 -p "$preview_port" -R -t disableLeaveAlert=true \
   tmux attach-session -r -t "$group_session" \
   > "${state_dir}/${group_session}-preview.log" 2>&1 < /dev/null &
 
-nohup ttyd -i 127.0.0.1 -p "$detail_port" -W -t disableLeaveAlert=true \
+nohup ttyd -i 127.0.0.1 -p "$detail_port" -t disableLeaveAlert=true \
   tmux attach-session -t "$group_session" \
   > "${state_dir}/${group_session}-detail.log" 2>&1 < /dev/null &
 

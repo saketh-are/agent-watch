@@ -121,7 +121,9 @@ start_ttyd() {
   local -a cmd
   cmd=(ttyd -i "$bind_host" -p "$port" -t disableLeaveAlert=true)
   if [[ "$mode" == "detail" ]]; then
-    cmd+=(-W)
+    :
+  else
+    cmd+=(-R)
   fi
 
   if [[ "$backend" == "tmux" ]]; then
