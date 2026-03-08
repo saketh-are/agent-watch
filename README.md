@@ -1,12 +1,13 @@
 # agent-watch
 
-Small HTTPS dashboard for monitoring multiple `ttyd` sessions from one place.
+Private HTTPS dashboard for monitoring remote agent terminals, with live `Active` / `Waiting` / `Syncing` status on top of proxied `ttyd` sessions.
 
 ## What it does
 
-- Shows every configured terminal on the home page as a stacked preview.
-- Gives each agent its own full-screen route under `/agents/:id`.
-- Proxies each `ttyd` endpoint through one local origin so the UI can stay on HTTPS even if your upstream `ttyd` servers are plain HTTP.
+- Shows every configured agent on the home page as a stacked live terminal card.
+- Detects visible terminal activity and marks each agent as `Active`, `Waiting`, or `Syncing`.
+- Gives each agent its own focused full-screen route under `/agents/:id`.
+- Proxies each upstream `ttyd` endpoint through one local origin so the UI can stay on HTTPS even if your agent hosts only expose plain HTTP.
 
 ## Quick start
 
@@ -23,6 +24,7 @@ Small HTTPS dashboard for monitoring multiple `ttyd` sessions from one place.
    ```
 
 3. Edit `config/agents.json` and set each agent `target` to its `ttyd` URL.
+   You can also tune the activity monitor in the top-level `monitor` block.
 
 4. Start the dashboard:
 
@@ -76,7 +78,7 @@ Notes:
 - `monitor.syncWindowMs` keeps a card in `Syncing` after load/reconnect before activity detection starts.
 - `monitor.settleWindowMs` is how long terminal content must stay unchanged during sync before bootstrap redraws stop counting as startup noise.
 - `monitor.ignoredBottomRows` skips the last N terminal rows when comparing content, which is useful for byobu status bars.
-- `target` is the upstream `ttyd` URL for the full agent page.
+- `target` is the upstream interactive `ttyd` URL for the full agent page.
 - `previewTarget` is optional. If omitted, previews use `target`.
 - `headers` is optional and gets forwarded to the upstream `ttyd` server.
 - `insecureSkipVerify` is useful if the upstream `ttyd` server uses a self-signed cert.
@@ -100,6 +102,14 @@ ttyd -T xterm-direct -W -p 7682 byobu attach -t agent-alpha
 
 Then point `previewTarget` to the read-only endpoint and `target` to the interactive one.
 
+## Why this exists
+
+This is aimed at remote coding or automation agents running in terminal multiplexers such as byobu or tmux. The home page is meant to answer:
+
+- Which agents are currently doing work?
+- Which ones are idle and waiting for input?
+- Which terminal do I need to jump into right now?
+
 ## Helper script
 
 There is a VM-side helper at `scripts/publish_byobu_sessions.sh`.
@@ -115,6 +125,7 @@ What it does:
 - Detects whether byobu is using `tmux` or `screen`
 - Finds the current sessions
 - Starts a preview `ttyd` endpoint and a detail `ttyd` endpoint for each session
+- Configures tmux/ttyd for RGB-capable browser terminals
 - Prints dashboard JSON entries and an `ssh -L` command you can run locally
 
 ## Custom TLS

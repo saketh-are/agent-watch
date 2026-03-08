@@ -113,6 +113,35 @@ const terminalUnloadPatch = [
   '      }, 100);',
   '    }',
   '  } catch {}',
+  '  try {',
+  '    const installTrackpadScroll = () => {',
+  '      const doc = window.document;',
+  '      const root = doc.querySelector(".xterm");',
+  '      const viewport = doc.querySelector(".xterm-viewport");',
+  '      if (!root || !viewport) return false;',
+  '      if (root.dataset.agentWatchTrackpadScroll === "1") return true;',
+  '      root.dataset.agentWatchTrackpadScroll = "1";',
+  '      doc.addEventListener("wheel", (event) => {',
+  '        if (!(event.target instanceof Element) || !event.target.closest(".xterm")) return;',
+  '        viewport.scrollTop += event.deltaY;',
+  '        try {',
+  '          const term = window.term;',
+  '          if (term && typeof term.focus === "function") term.focus();',
+  '        } catch {}',
+  '        event.preventDefault();',
+  '      }, { passive: false, capture: true });',
+  '      return true;',
+  '    };',
+  '    if (!installTrackpadScroll()) {',
+  '      let attempts = 0;',
+  '      const timer = window.setInterval(() => {',
+  '        attempts += 1;',
+  '        if (installTrackpadScroll() || attempts > 80) {',
+  '          window.clearInterval(timer);',
+  '        }',
+  '      }, 100);',
+  '    }',
+  '  } catch {}',
   '})();',
   '</script>'
 ].join('');
@@ -558,6 +587,7 @@ function applyWarpTerminalTheme(html) {
     .replace(/theme:\{[^}]*foreground:"#[0-9a-fA-F]{6}"[^}]*\}/g, warpSolarizedDarkThemeLiteral)
     .replace(/rendererType:"webgl"/g, 'rendererType:"canvas"')
     .replace(/\.xterm \.composition-view\{background:#000;color:#fff;/g, '.xterm .composition-view{background:#002b36;color:#f8f8f2;')
+    .replace(/overflow-y:scroll;/g, 'overflow-y:scroll;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;')
     .replace(/\.xterm \.xterm-viewport\{background-color:#000;/g, '.xterm .xterm-viewport{background-color:#002b36;')
     .replace(/body,html\{height:100%;margin:0;min-height:100%;overflow:hidden\}/g, 'body,html{height:100%;margin:0;min-height:100%;overflow:hidden;background:#002b36;color:#f8f8f2}')
     .replace(/#terminal-container\{height:100%;margin:0 auto;padding:0;width:auto\}/g, '#terminal-container{height:100%;margin:0 auto;padding:0;width:auto;background:#002b36}')

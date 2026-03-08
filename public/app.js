@@ -2,6 +2,7 @@ const app = document.querySelector('#app');
 const nav = document.querySelector('#site-nav');
 const siteTitle = document.querySelector('#site-title');
 const siteSubtitle = document.querySelector('#site-subtitle');
+const currentTerminalLink = document.querySelector('#current-terminal-link');
 const configButton = document.querySelector('#config-button');
 const configModal = document.querySelector('#config-modal');
 const configPath = document.querySelector('#config-path');
@@ -147,7 +148,7 @@ function renderCurrentRoute() {
   }
 
   if (route.kind === 'agent') {
-    disconnectHomeTerminals();
+    syncHomeTerminals(routeAgent.id);
     connectDetailTerminal(routeAgent);
     showOnly(ensureDetailView(routeAgent));
     focusRouteTerminal();
@@ -155,7 +156,7 @@ function renderCurrentRoute() {
   }
 
   disconnectDetailTerminals();
-  reconnectHomeTerminals();
+  syncHomeTerminals();
   showOnly(state.views.home);
   focusRouteTerminal();
 }
@@ -164,6 +165,22 @@ function renderShell(config, routeAgent) {
   siteTitle.textContent = config.site.title;
   siteSubtitle.textContent = config.site.subtitle;
   document.title = routeAgent ? `${routeAgent.name} · ${config.site.title}` : config.site.title;
+
+  if (currentTerminalLink instanceof HTMLAnchorElement) {
+    if (routeAgent) {
+      currentTerminalLink.hidden = false;
+      currentTerminalLink.href = routeAgent.detailPath;
+      currentTerminalLink.textContent = routeAgent.source;
+      currentTerminalLink.setAttribute('aria-label', `Open ${routeAgent.name} terminal only`);
+      currentTerminalLink.title = 'Open terminal only';
+    } else {
+      currentTerminalLink.hidden = true;
+      currentTerminalLink.removeAttribute('href');
+      currentTerminalLink.textContent = '';
+      currentTerminalLink.removeAttribute('aria-label');
+      currentTerminalLink.removeAttribute('title');
+    }
+  }
 
   const links = [
     { href: '/', label: '🏠', active: route.kind === 'home', ariaLabel: 'Home' },
@@ -293,26 +310,8 @@ function renderPreviewCard(agent) {
 }
 
 function renderAgentDetail(agent) {
-  const badge = agent.badge
-    ? `<span class="agent-badge">${escapeHtml(agent.badge)}</span>`
-    : '';
-
   return `
     <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
-      <section class="detail-header" style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}">
-        <div class="detail-header__summary">
-          <div class="detail-header__title-row">
-            <h2>${escapeHtml(agent.name)}</h2>
-            ${badge}
-          </div>
-        </div>
-        <div class="detail-header__actions">
-          <span class="agent-source">${escapeHtml(agent.source)}</span>
-          <a class="agent-button agent-button--secondary" href="${agent.detailPath}" target="_blank" rel="noreferrer">
-            Open terminal only
-          </a>
-        </div>
-      </section>
       <section class="detail-terminal">
         <iframe
           class="terminal-frame terminal-frame--detail"
@@ -748,27 +747,7 @@ function saveStoredAgentOrder(agents) {
   } catch {}
 }
 
-function disconnectHomeTerminals() {
-  const homeView = state.views.home;
-  if (!homeView) {
-    return;
-  }
-
-  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    const frame = terminal.querySelector('[data-home-terminal-frame]');
-    const card = terminal.closest('[data-agent-card]');
-    if (!(frame instanceof HTMLIFrameElement) || !card) {
-      continue;
-    }
-
-    card.classList.remove('is-live');
-    if (frame.getAttribute('src')) {
-      frame.removeAttribute('src');
-    }
-  }
-}
-
-function reconnectHomeTerminals() {
+function syncHomeTerminals(excludedAgentId = null) {
   const homeView = state.views.home;
   if (!homeView) {
     return;
@@ -783,14 +762,25 @@ function reconnectHomeTerminals() {
       continue;
     }
 
-    if (frame.getAttribute('src') !== detailPath) {
-      frame.src = detailPath;
-      state.activity.byAgent.delete(agentId);
-      setAgentActivityStatus(card, 'syncing');
+    const shouldConnect = agentId !== excludedAgentId && !hasConnectedDetailTerminal(agentId);
+    if (shouldConnect) {
+      if (frame.getAttribute('src') !== detailPath) {
+        frame.src = detailPath;
+        state.activity.byAgent.delete(agentId);
+        setAgentActivityStatus(agentId, 'syncing');
+      }
+    } else if (frame.getAttribute('src')) {
+      frame.removeAttribute('src');
     }
 
-    card.classList.toggle('is-live', terminal.dataset.agentId === state.activeHomeAgentId);
+    card.classList.toggle('is-live', shouldConnect && terminal.dataset.agentId === state.activeHomeAgentId);
   }
+}
+
+function hasConnectedDetailTerminal(agentId) {
+  const detailView = state.views.detailById.get(agentId);
+  const detailFrame = detailView?.querySelector('.terminal-frame--detail');
+  return detailFrame instanceof HTMLIFrameElement && Boolean(detailFrame.getAttribute('src'));
 }
 
 function disconnectDetailTerminals() {
@@ -848,8 +838,8 @@ function bindHomeTerminals(homeView) {
 
 function startActivityMonitor() {
   stopActivityMonitor();
-  updateHomeActivityStatuses();
-  state.activity.intervalId = window.setInterval(updateHomeActivityStatuses, getMonitorConfig().pollMs);
+  updateActivityStatuses();
+  state.activity.intervalId = window.setInterval(updateActivityStatuses, getMonitorConfig().pollMs);
 }
 
 function stopActivityMonitor() {
@@ -862,9 +852,8 @@ function stopActivityMonitor() {
   state.activity.statusByAgent.clear();
 }
 
-function updateHomeActivityStatuses() {
-  const homeView = state.views.home;
-  if (!homeView) {
+function updateActivityStatuses() {
+  if (!state.config?.agents?.length) {
     return;
   }
 
@@ -872,26 +861,29 @@ function updateHomeActivityStatuses() {
   const monitor = getMonitorConfig();
   let shouldPlayInactiveAlert = false;
 
-  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    const frame = terminal.querySelector('[data-home-terminal-frame]');
-    const card = terminal.closest('[data-agent-card]');
-    const { agentId } = terminal.dataset;
-    if (!(frame instanceof HTMLIFrameElement) || !card || !agentId) {
-      continue;
-    }
-
-    const signature = readVisibleTerminalSignature(frame);
+  for (const agent of state.config.agents) {
+    const agentId = agent.id;
+    const source = getAgentActivitySource(agentId);
     const previous = state.activity.byAgent.get(agentId);
-    if (signature === null) {
+
+    if (!source) {
       if (!previous) {
-        setAgentActivityStatus(card, 'syncing');
+        setAgentActivityStatus(agentId, 'syncing');
       }
       continue;
     }
 
-    const nextState = previous
-      ? { ...previous }
-      : {
+    const signature = readVisibleTerminalSignature(source.frame);
+    if (signature === null) {
+      if (!previous || previous.sourceKey !== source.sourceKey) {
+        setAgentActivityStatus(agentId, 'syncing');
+      }
+      continue;
+    }
+
+    const nextState = !previous || previous.sourceKey !== source.sourceKey
+      ? {
+          sourceKey: source.sourceKey,
           signature,
           lastChangedAt: null,
           syncChangedAt: null,
@@ -900,7 +892,14 @@ function updateHomeActivityStatuses() {
           syncSettledAt: null,
           status: 'syncing',
           syncUntil: now + monitor.syncWindowMs
-        };
+        }
+      : { ...previous };
+
+    if (!previous || previous.sourceKey !== source.sourceKey) {
+      state.activity.byAgent.set(agentId, nextState);
+      setAgentActivityStatus(agentId, nextState.status);
+      continue;
+    }
 
     if (nextState.signature !== signature) {
       nextState.signature = signature;
@@ -921,7 +920,7 @@ function updateHomeActivityStatuses() {
     if (nextState.syncUntil && now < nextState.syncUntil) {
       nextState.status = 'syncing';
       state.activity.byAgent.set(agentId, nextState);
-      setAgentActivityStatus(card, nextState.status);
+      setAgentActivityStatus(agentId, nextState.status);
       continue;
     }
 
@@ -941,7 +940,7 @@ function updateHomeActivityStatuses() {
       : 'waiting';
     shouldPlayInactiveAlert ||= previous?.status === 'active' && nextState.status === 'waiting';
     state.activity.byAgent.set(agentId, nextState);
-    setAgentActivityStatus(card, nextState.status);
+    setAgentActivityStatus(agentId, nextState.status);
   }
 
   if (shouldPlayInactiveAlert) {
@@ -983,9 +982,28 @@ function readVisibleTerminalSignature(frame) {
   }
 }
 
-function setAgentActivityStatus(card, status) {
-  const agentId = card.dataset.agentCard || '';
-  const label = card.querySelector('[data-agent-status]');
+function getAgentActivitySource(agentId) {
+  const detailView = state.views.detailById.get(agentId);
+  const detailFrame = detailView?.querySelector('.terminal-frame--detail');
+  if (detailFrame instanceof HTMLIFrameElement && detailFrame.getAttribute('src')) {
+    return { frame: detailFrame, sourceKey: `detail:${agentId}` };
+  }
+
+  const homeFrame = state.views.home?.querySelector(
+    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-home-terminal-frame]`
+  );
+  if (homeFrame instanceof HTMLIFrameElement && homeFrame.getAttribute('src')) {
+    return { frame: homeFrame, sourceKey: `home:${agentId}` };
+  }
+
+  return null;
+}
+
+function setAgentActivityStatus(agentId, status) {
+  const card = agentId
+    ? state.views.home?.querySelector(`[data-agent-card="${CSS.escape(agentId)}"]`)
+    : null;
+  const label = card?.querySelector('[data-agent-status]');
   const nextText = {
     active: 'Active',
     waiting: 'Waiting',
@@ -997,9 +1015,11 @@ function setAgentActivityStatus(card, status) {
     setNavAgentActivityStatus(agentId, status);
   }
 
-  card.classList.toggle('is-status-active', status === 'active');
-  card.classList.toggle('is-status-waiting', status === 'waiting');
-  card.classList.toggle('is-status-syncing', status === 'syncing');
+  if (card instanceof HTMLElement) {
+    card.classList.toggle('is-status-active', status === 'active');
+    card.classList.toggle('is-status-waiting', status === 'waiting');
+    card.classList.toggle('is-status-syncing', status === 'syncing');
+  }
 
   if (!(label instanceof HTMLElement)) {
     return;
@@ -1013,8 +1033,8 @@ function setAgentActivityStatus(card, status) {
 
 function syncNavActivityStatuses() {
   for (const agent of state.config?.agents || []) {
-    const status = state.activity.statusByAgent.get(agent.id);
-    setNavAgentActivityStatus(agent.id, status || null);
+    const status = state.activity.statusByAgent.get(agent.id) || 'syncing';
+    setNavAgentActivityStatus(agent.id, status);
   }
 }
 
