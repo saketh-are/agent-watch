@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -18,6 +19,16 @@ const configPath = process.env.AGENT_WATCH_CONFIG || path.join(rootDir, 'config'
 const port = Number.parseInt(process.env.PORT || '3443', 10);
 const host = process.env.HOST || '0.0.0.0';
 const httpOnly = process.env.HTTP_ONLY === '1';
+const auth = getAuthConfig();
+const terminalRootCacheTtlMs = 1000 * 60 * 10;
+const snapshotPreviewMaxLines = 28;
+let configCache = null;
+let configRawCache = null;
+let configWatcher = null;
+let agentMonitorTimer = null;
+let agentMonitorRunning = false;
+const terminalRootCache = new Map();
+const agentMonitorState = new Map();
 const warpSolarizedDarkThemeLiteral = [
   'theme:{',
   'foreground:"#f8f8f2",',
@@ -178,6 +189,77 @@ proxy.on('error', (error, req, resOrSocket) => {
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false }));
+
+app.get('/login', (req, res) => {
+  if (!auth.enabled) {
+    res.redirect('/');
+    return;
+  }
+
+  if (isAuthenticated(req)) {
+    res.redirect(normalizeNextPath(req.query.next));
+    return;
+  }
+
+  res
+    .status(200)
+    .type('html')
+    .setHeader('cache-control', 'no-store')
+    .send(renderLoginPage({
+      next: normalizeNextPath(req.query.next)
+    }));
+});
+
+app.post('/login', (req, res) => {
+  if (!auth.enabled) {
+    res.redirect('/');
+    return;
+  }
+
+  const nextPath = normalizeNextPath(req.body?.next);
+  const username = String(req.body?.username || '');
+  const password = String(req.body?.password || '');
+
+  if (username !== auth.user || password !== auth.password) {
+    res
+      .status(401)
+      .type('html')
+      .setHeader('cache-control', 'no-store')
+      .send(renderLoginPage({
+        next: nextPath,
+        error: 'Incorrect username or password.'
+      }));
+    return;
+  }
+
+  setAuthCookie(res, req);
+  res.redirect(nextPath);
+});
+
+app.post('/logout', (req, res) => {
+  clearAuthCookie(res, req);
+  res.redirect('/login');
+});
+
+app.use((req, res, next) => {
+  if (!auth.enabled || req.path === '/login') {
+    next();
+    return;
+  }
+
+  if (isAuthenticated(req)) {
+    next();
+    return;
+  }
+
+  if (req.method === 'GET' && acceptsHtml(req)) {
+    res.redirect(`/login?next=${encodeURIComponent(normalizeNextPath(req.originalUrl || req.url || '/'))}`);
+    return;
+  }
+
+  res.status(401).json({ error: 'Authentication required' });
+});
 
 app.get('/api/config', (_req, res) => {
   try {
@@ -187,6 +269,19 @@ app.get('/api/config', (_req, res) => {
   } catch (error) {
     res.status(500).json({
       error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+  }
+});
+
+app.get('/api/state', (_req, res) => {
+  try {
+    const config = loadConfig();
+    res.setHeader('cache-control', 'no-store');
+    res.json(buildPublicAgentState(config));
+  } catch (error) {
+    res.status(500).json({
+      error: 'Could not load dashboard state',
       detail: error.message
     });
   }
@@ -278,19 +373,14 @@ const server = httpOnly
   : https.createServer(getHttpsOptions(), app);
 
 server.on('upgrade', (req, socket, head) => {
+  if (auth.enabled && !isAuthenticated(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
   const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
   const match = parsedUrl.pathname.match(/^\/terminal\/([^/]+)\/([^/]+)(\/.*)?$/);
-
-  if (!match) {
-    socket.destroy();
-    return;
-  }
-
-  const [, id, mode] = match;
-  if (!isSupportedMode(mode)) {
-    socket.destroy();
-    return;
-  }
 
   let config;
   try {
@@ -300,28 +390,43 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  const agent = config.agents.find((item) => item.id === id);
-  if (!agent) {
-    socket.destroy();
+  if (match) {
+    const [, id, mode] = match;
+    if (!isSupportedMode(mode)) {
+      socket.destroy();
+      return;
+    }
+
+    const agent = config.agents.find((item) => item.id === id);
+    if (!agent) {
+      socket.destroy();
+      return;
+    }
+
+    const upstream = getUpstream(agent, mode);
+    req.url = joinTargetPath(upstream.pathname, parsedUrl.pathname.replace(`/terminal/${id}/${mode}`, '') || '/') + parsedUrl.search;
+
+    proxy.ws(req, socket, head, {
+      target: upstream.origin,
+      secure: !agent.insecureSkipVerify,
+      headers: agent.headers || {}
+    });
     return;
   }
 
-  const upstream = getUpstream(agent, mode);
-  req.url = joinTargetPath(upstream.pathname, parsedUrl.pathname.replace(`/terminal/${id}/${mode}`, '') || '/') + parsedUrl.search;
-
-  proxy.ws(req, socket, head, {
-    target: upstream.origin,
-    secure: !agent.insecureSkipVerify,
-    headers: agent.headers || {}
-  });
+  socket.destroy();
 });
 
 try {
+  validateAuthConfig();
   loadConfig();
 } catch (error) {
   console.error(`[agent-watch] ${error.message}`);
   process.exit(1);
 }
+
+startConfigWatcher();
+scheduleAgentMonitor(0);
 
 server.listen(port, host, () => {
   const protocol = httpOnly ? 'http' : 'https';
@@ -333,8 +438,13 @@ server.listen(port, host, () => {
 });
 
 function loadConfig() {
+  if (configCache) {
+    return configCache;
+  }
+
   const { raw } = readConfigFile();
-  return normalizeConfig(JSON.parse(raw));
+  configCache = normalizeConfig(JSON.parse(raw));
+  return configCache;
 }
 
 function buildPublicConfig(config) {
@@ -357,6 +467,22 @@ function buildPublicConfig(config) {
   };
 }
 
+function buildPublicAgentState(config) {
+  return {
+    generatedAt: new Date().toISOString(),
+    agents: config.agents.map((agent) => {
+      const monitorState = agentMonitorState.get(agent.id);
+      return {
+        id: agent.id,
+        status: monitorState?.status || 'syncing',
+        snapshot: monitorState?.previewText || '',
+        capturedAt: monitorState?.capturedAt || null,
+        error: monitorState?.error || null
+      };
+    })
+  };
+}
+
 function validateAgents(agents) {
   const seenIds = new Set();
 
@@ -373,6 +499,9 @@ function validateAgents(agents) {
     new URL(agent.target);
     if (agent.previewTarget) {
       new URL(agent.previewTarget);
+    }
+    if (agent.snapshotTarget) {
+      new URL(agent.snapshotTarget);
     }
   }
 }
@@ -394,14 +523,22 @@ function validateMonitorConfig(monitor) {
 }
 
 function readConfigFile() {
-  if (!fs.existsSync(configPath)) {
+  if (configRawCache !== null) {
     return {
-      raw: `${JSON.stringify(getDefaultConfig(), null, 2)}\n`
+      raw: configRawCache
     };
   }
 
+  if (!fs.existsSync(configPath)) {
+    configRawCache = `${JSON.stringify(getDefaultConfig(), null, 2)}\n`;
+    return {
+      raw: configRawCache
+    };
+  }
+
+  configRawCache = fs.readFileSync(configPath, 'utf8');
   return {
-    raw: fs.readFileSync(configPath, 'utf8')
+    raw: configRawCache
   };
 }
 
@@ -420,6 +557,10 @@ function writeConfigFile(raw) {
 
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   fs.writeFileSync(configPath, serialized, 'utf8');
+  configRawCache = serialized;
+  configCache = normalized;
+  terminalRootCache.clear();
+  scheduleAgentMonitor(0);
   return serialized;
 }
 
@@ -497,6 +638,14 @@ function shouldPatchTerminalRoot(req) {
 
 function proxyTerminalRoot(req, res, upstream, agent) {
   const targetUrl = new URL(req.url, upstream.origin);
+  const cacheKey = getTerminalRootCacheKey(targetUrl);
+  const cached = terminalRootCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < terminalRootCacheTtlMs) {
+    res.writeHead(cached.statusCode, { ...cached.headers });
+    res.end(cached.body);
+    return;
+  }
+
   const transport = upstream.protocol === 'https:' ? https : http;
   const headers = {
     ...filterProxyRequestHeaders(req.headers),
@@ -534,13 +683,26 @@ function proxyTerminalRoot(req, res, upstream, agent) {
         responseHeaders['content-length'] = String(Buffer.byteLength(patchedBody));
         responseHeaders['content-type'] = contentType || 'text/html; charset=utf-8';
         responseHeaders['cache-control'] = 'no-store';
-        res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+        const statusCode = upstreamRes.statusCode || 200;
+        terminalRootCache.set(cacheKey, {
+          cachedAt: Date.now(),
+          statusCode,
+          headers: { ...responseHeaders },
+          body: patchedBody
+        });
+        res.writeHead(statusCode, responseHeaders);
         res.end(patchedBody);
       });
     }
   );
 
   upstreamReq.on('error', (error) => {
+    if (cached) {
+      res.writeHead(cached.statusCode, { ...cached.headers });
+      res.end(cached.body);
+      return;
+    }
+
     res.status(502).json({
       error: 'Proxy request failed',
       detail: error.message
@@ -565,6 +727,10 @@ function sanitizeProxyHeaders(headers) {
   delete nextHeaders['content-encoding'];
   delete nextHeaders['transfer-encoding'];
   return nextHeaders;
+}
+
+function getTerminalRootCacheKey(targetUrl) {
+  return `${targetUrl.origin}${targetUrl.pathname}`;
 }
 
 function patchTerminalHtml(html) {
@@ -592,6 +758,232 @@ function applyWarpTerminalTheme(html) {
     .replace(/body,html\{height:100%;margin:0;min-height:100%;overflow:hidden\}/g, 'body,html{height:100%;margin:0;min-height:100%;overflow:hidden;background:#002b36;color:#f8f8f2}')
     .replace(/#terminal-container\{height:100%;margin:0 auto;padding:0;width:auto\}/g, '#terminal-container{height:100%;margin:0 auto;padding:0;width:auto;background:#002b36}')
     .replace(/#terminal-container \.terminal\{height:calc\(100% - 10px\);padding:5px\}/g, '#terminal-container .terminal{height:calc(100% - 10px);padding:5px;background:#002b36}');
+}
+
+function startConfigWatcher() {
+  if (configWatcher) {
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+
+  try {
+    configWatcher = fs.watch(path.dirname(configPath), (_eventType, filename) => {
+      if (!filename || String(filename) === path.basename(configPath)) {
+        invalidateConfigCache();
+      }
+    });
+    configWatcher.on('error', () => {});
+  } catch {}
+}
+
+function invalidateConfigCache() {
+  configCache = null;
+  configRawCache = null;
+  terminalRootCache.clear();
+  scheduleAgentMonitor(0);
+}
+
+function scheduleAgentMonitor(delayMs = null) {
+  if (agentMonitorTimer) {
+    clearTimeout(agentMonitorTimer);
+  }
+
+  const delay = delayMs ?? getAgentMonitorDelay();
+  agentMonitorTimer = setTimeout(() => {
+    runAgentMonitor().catch((error) => {
+      console.error(`[agent-watch] monitor error: ${error.message}`);
+    });
+  }, Math.max(0, delay));
+}
+
+function getAgentMonitorDelay() {
+  try {
+    return loadConfig().monitor.pollMs;
+  } catch {
+    return getDefaultMonitorConfig().pollMs;
+  }
+}
+
+async function runAgentMonitor() {
+  if (agentMonitorRunning) {
+    scheduleAgentMonitor();
+    return;
+  }
+
+  agentMonitorRunning = true;
+
+  try {
+    const config = loadConfig();
+    const now = Date.now();
+    const activeIds = new Set(config.agents.map((agent) => agent.id));
+    const responses = await Promise.all(config.agents.map((agent) => fetchAgentSnapshot(agent)));
+
+    config.agents.forEach((agent, index) => {
+      updateAgentMonitorState(agent, responses[index], config.monitor, now);
+    });
+
+    for (const agentId of [...agentMonitorState.keys()]) {
+      if (!activeIds.has(agentId)) {
+        agentMonitorState.delete(agentId);
+      }
+    }
+  } catch (error) {
+    console.error(`[agent-watch] monitor error: ${error.message}`);
+  } finally {
+    agentMonitorRunning = false;
+    scheduleAgentMonitor();
+  }
+}
+
+async function fetchAgentSnapshot(agent) {
+  if (!agent.snapshotTarget) {
+    return {
+      ok: false,
+      error: 'Snapshot target is not configured.'
+    };
+  }
+
+  try {
+    const response = await fetch(agent.snapshotTarget, {
+      headers: {
+        accept: 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `Snapshot request failed with ${response.status}`
+      };
+    }
+
+    const payload = await response.json();
+    const text = normalizeSnapshotText(payload.text);
+
+    return {
+      ok: true,
+      text,
+      capturedAt: payload.capturedAt || new Date().toISOString()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message || 'Snapshot request failed'
+    };
+  }
+}
+
+function normalizeSnapshotText(value) {
+  return String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+}
+
+function updateAgentMonitorState(agent, snapshot, monitor, now) {
+  const previous = agentMonitorState.get(agent.id);
+
+  if (!snapshot.ok) {
+    agentMonitorState.set(agent.id, {
+      ...previous,
+      status: previous?.status || 'syncing',
+      previewText: previous?.previewText || '',
+      signature: previous?.signature || '',
+      capturedAt: previous?.capturedAt || null,
+      error: snapshot.error || 'Snapshot unavailable'
+    });
+    return;
+  }
+
+  const previewText = buildPreviewSnapshot(snapshot.text, monitor);
+  const signature = buildSnapshotSignature(snapshot.text, monitor);
+  const nextState = !previous
+    ? {
+        signature,
+        previewText,
+        capturedAt: snapshot.capturedAt,
+        lastChangedAt: null,
+        syncChangedAt: null,
+        syncSawChange: false,
+        syncStableSince: now,
+        syncSettledAt: null,
+        syncUntil: now + monitor.syncWindowMs,
+        status: 'syncing',
+        error: null
+      }
+    : {
+        ...previous,
+        previewText,
+        capturedAt: snapshot.capturedAt,
+        error: null
+      };
+
+  if (!previous) {
+    agentMonitorState.set(agent.id, nextState);
+    return;
+  }
+
+  if (nextState.signature !== signature) {
+    nextState.signature = signature;
+    if (nextState.syncUntil) {
+      nextState.syncStableSince = now;
+      if (nextState.syncSettledAt) {
+        nextState.syncChangedAt = now;
+      } else {
+        nextState.syncSawChange = true;
+      }
+    } else {
+      nextState.lastChangedAt = now;
+    }
+  } else if (nextState.syncUntil && !nextState.syncSettledAt && now - nextState.syncStableSince >= monitor.settleWindowMs) {
+    nextState.syncSettledAt = now;
+  }
+
+  if (nextState.syncUntil && now < nextState.syncUntil) {
+    nextState.status = 'syncing';
+    agentMonitorState.set(agent.id, nextState);
+    return;
+  }
+
+  if (nextState.syncUntil) {
+    nextState.lastChangedAt = nextState.syncSettledAt
+      ? nextState.syncChangedAt
+      : (nextState.syncSawChange ? nextState.syncStableSince : null);
+    nextState.syncChangedAt = null;
+    nextState.syncSawChange = false;
+    nextState.syncStableSince = null;
+    nextState.syncSettledAt = null;
+    nextState.syncUntil = null;
+  }
+
+  nextState.status = nextState.lastChangedAt && now - nextState.lastChangedAt <= monitor.activeWindowMs
+    ? 'active'
+    : 'waiting';
+
+  agentMonitorState.set(agent.id, nextState);
+}
+
+function buildPreviewSnapshot(text, monitor) {
+  const lines = splitSnapshotLines(text);
+  const trimmed = trimIgnoredBottomRows(lines, monitor.ignoredBottomRows);
+  return trimmed.slice(-snapshotPreviewMaxLines).join('\n');
+}
+
+function buildSnapshotSignature(text, monitor) {
+  return trimIgnoredBottomRows(splitSnapshotLines(text), monitor.ignoredBottomRows).join('\n');
+}
+
+function splitSnapshotLines(text) {
+  return normalizeSnapshotText(text).split('\n');
+}
+
+function trimIgnoredBottomRows(lines, ignoredBottomRows) {
+  const ignoredCount = Math.max(0, Number(ignoredBottomRows || 0));
+  const trimmed = ignoredCount ? lines.slice(0, Math.max(1, lines.length - ignoredCount)) : [...lines];
+  while (trimmed.length > 1 && trimmed[trimmed.length - 1] === '') {
+    trimmed.pop();
+  }
+  return trimmed;
 }
 
 function getHttpsOptions() {
@@ -641,4 +1033,321 @@ function getHttpsOptions() {
 
 function displayHost(value) {
   return value === '0.0.0.0' ? 'localhost' : value;
+}
+
+function validateAuthConfig() {
+  if (!auth.user && !auth.password) {
+    return;
+  }
+
+  if (!auth.user || !auth.password) {
+    throw new Error('Set both AGENT_WATCH_AUTH_USER and AGENT_WATCH_AUTH_PASSWORD, or neither.');
+  }
+}
+
+function getAuthConfig() {
+  const user = process.env.AGENT_WATCH_AUTH_USER || '';
+  const password = process.env.AGENT_WATCH_AUTH_PASSWORD || '';
+  const secretSeed = process.env.AGENT_WATCH_SESSION_SECRET || `${user}\n${password}\nagent-watch`;
+
+  return {
+    enabled: Boolean(user && password),
+    user,
+    password,
+    cookieName: 'agent_watch_session',
+    maxAgeMs: 1000 * 60 * 60 * 24 * 30,
+    secret: crypto.createHash('sha256').update(secretSeed).digest('hex')
+  };
+}
+
+function isAuthenticated(req) {
+  if (!auth.enabled) {
+    return true;
+  }
+
+  const cookies = parseCookies(req.headers.cookie || '');
+  return verifySessionToken(cookies[auth.cookieName] || '');
+}
+
+function parseCookies(rawCookieHeader) {
+  const cookies = {};
+
+  for (const part of String(rawCookieHeader).split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    cookies[key] = decodeURIComponent(value);
+  }
+
+  return cookies;
+}
+
+function setAuthCookie(res, req) {
+  const cookieParts = [
+    `${auth.cookieName}=${encodeURIComponent(issueSessionToken())}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(auth.maxAgeMs / 1000)}`
+  ];
+
+  if (shouldUseSecureCookies(req)) {
+    cookieParts.push('Secure');
+  }
+
+  res.setHeader('set-cookie', cookieParts.join('; '));
+}
+
+function clearAuthCookie(res, req) {
+  const cookieParts = [
+    `${auth.cookieName}=`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0',
+    'Expires=Thu, 01 Jan 1970 00:00:00 GMT'
+  ];
+
+  if (shouldUseSecureCookies(req)) {
+    cookieParts.push('Secure');
+  }
+
+  res.setHeader('set-cookie', cookieParts.join('; '));
+}
+
+function shouldUseSecureCookies(req) {
+  if (!httpOnly) {
+    return true;
+  }
+
+  return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+}
+
+function issueSessionToken() {
+  const expiresAt = Date.now() + auth.maxAgeMs;
+  const payload = Buffer.from(`${auth.user}:${expiresAt}`, 'utf8').toString('base64url');
+  const signature = signTokenPayload(payload);
+  return `${payload}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  const [payload, signature] = String(token).split('.');
+  if (!payload || !signature) {
+    return false;
+  }
+
+  const expectedSignature = signTokenPayload(payload);
+  if (!safeCompare(signature, expectedSignature)) {
+    return false;
+  }
+
+  let decoded;
+  try {
+    decoded = Buffer.from(payload, 'base64url').toString('utf8');
+  } catch {
+    return false;
+  }
+
+  const separatorIndex = decoded.indexOf(':');
+  if (separatorIndex <= 0) {
+    return false;
+  }
+
+  const user = decoded.slice(0, separatorIndex);
+  const expiresAt = Number.parseInt(decoded.slice(separatorIndex + 1), 10);
+
+  return user === auth.user && Number.isFinite(expiresAt) && Date.now() < expiresAt;
+}
+
+function signTokenPayload(payload) {
+  return crypto.createHmac('sha256', auth.secret).update(payload).digest('base64url');
+}
+
+function safeCompare(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function acceptsHtml(req) {
+  const accept = String(req.headers.accept || '');
+  return accept.includes('text/html') || accept.includes('*/*');
+}
+
+function normalizeNextPath(input) {
+  const candidate = String(input || '').trim();
+
+  if (!candidate || !candidate.startsWith('/') || candidate.startsWith('//')) {
+    return '/';
+  }
+
+  if (candidate === '/login' || candidate.startsWith('/login?')) {
+    return '/';
+  }
+
+  return candidate;
+}
+
+function renderLoginPage({ next, error = '' }) {
+  const errorMarkup = error
+    ? `<p class="login-card__error" role="alert">${escapeHtml(error)}</p>`
+    : '';
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Watch Login</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #13110d;
+        --panel: rgba(243, 237, 224, 0.92);
+        --panel-border: rgba(130, 96, 57, 0.22);
+        --text: #1f1b16;
+        --muted: #6b6254;
+        --accent: #b7652f;
+        --accent-strong: #8c4a21;
+        --error-bg: rgba(185, 64, 34, 0.12);
+        --error-text: #8c2c11;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top left, rgba(182, 101, 47, 0.24), transparent 34%),
+          radial-gradient(circle at bottom right, rgba(72, 120, 104, 0.28), transparent 30%),
+          linear-gradient(180deg, #13110d 0%, #211b15 100%);
+        color: var(--text);
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+        padding: 24px;
+      }
+
+      .login-card {
+        width: min(420px, 100%);
+        padding: 28px 28px 24px;
+        border: 1px solid var(--panel-border);
+        background: var(--panel);
+        border-radius: 18px;
+        box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+      }
+
+      .login-card__eyebrow {
+        margin: 0 0 8px;
+        font-size: 12px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+
+      .login-card h1 {
+        margin: 0 0 8px;
+        font-size: clamp(28px, 5vw, 40px);
+        line-height: 1;
+      }
+
+      .login-card__copy {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .login-card__error {
+        margin: 0 0 16px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: var(--error-bg);
+        color: var(--error-text);
+        font: 600 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+      }
+
+      .login-form {
+        display: grid;
+        gap: 14px;
+      }
+
+      .login-form label {
+        display: grid;
+        gap: 6px;
+        font: 600 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+      }
+
+      .login-form input {
+        width: 100%;
+        border: 1px solid rgba(111, 95, 72, 0.28);
+        border-radius: 12px;
+        padding: 12px 14px;
+        font: 500 15px/1.4 ui-sans-serif, system-ui, sans-serif;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .login-form input:focus {
+        outline: 2px solid rgba(183, 101, 47, 0.34);
+        border-color: rgba(183, 101, 47, 0.5);
+      }
+
+      .login-form button {
+        margin-top: 6px;
+        border: 0;
+        border-radius: 12px;
+        padding: 12px 16px;
+        background: linear-gradient(180deg, var(--accent) 0%, var(--accent-strong) 100%);
+        color: #f8f4ec;
+        font: 700 15px/1 ui-sans-serif, system-ui, sans-serif;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="login-card">
+      <p class="login-card__eyebrow">Agent Watch</p>
+      <h1>Sign in</h1>
+      <p class="login-card__copy">Sign in to view your agent dashboard.</p>
+      ${errorMarkup}
+      <form class="login-form" method="post" action="/login">
+        <input type="hidden" name="next" value="${escapeHtml(next)}">
+        <label>
+          Username
+          <input name="username" type="text" autocomplete="username" autocapitalize="off" autofocus required>
+        </label>
+        <label>
+          Password
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit">Open Agent Watch</button>
+      </form>
+    </main>
+  </body>
+</html>`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }

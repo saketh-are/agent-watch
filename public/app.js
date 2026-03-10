@@ -12,6 +12,7 @@ const configReloadButton = document.querySelector('#config-reload');
 const configSaveButton = document.querySelector('#config-save');
 const agentOrderStorageKey = 'agent-watch.agent-order';
 const inactiveAlertCooldownMs = 1200;
+const hiddenStatePollMs = 5000;
 const defaultMonitorConfig = Object.freeze({
   pollMs: 1000,
   activeWindowMs: 5000,
@@ -27,9 +28,15 @@ const state = {
   activeHomeAgentId: null,
   configModalOpen: false,
   activity: {
-    intervalId: null,
+    pollTimeoutId: null,
+    livePollTimeoutId: null,
+    requestInFlight: false,
     byAgent: new Map(),
-    statusByAgent: new Map()
+    serverStatusByAgent: new Map(),
+    liveStatusByAgent: new Map(),
+    liveSampleByAgent: new Map(),
+    statusByAgent: new Map(),
+    snapshotByAgent: new Map()
   },
   audio: {
     context: null,
@@ -40,6 +47,11 @@ const state = {
     agentId: null,
     targetId: null,
     position: null
+  },
+  nav: {
+    orderKey: '',
+    homeLink: null,
+    agentLinks: new Map()
   },
   views: {
     empty: null,
@@ -66,6 +78,7 @@ window.addEventListener('popstate', () => {
 });
 
 document.addEventListener('click', handleDocumentClick);
+document.addEventListener('visibilitychange', handleDocumentVisibilityChange);
 nav.addEventListener('dragstart', handleNavDragStart);
 nav.addEventListener('dragover', handleNavDragOver);
 nav.addEventListener('drop', handleNavDrop);
@@ -89,20 +102,28 @@ configSaveButton?.addEventListener('click', () => {
 });
 
 async function boot() {
-  const response = await fetch('/api/config', { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+  const [configResponse, stateResponse] = await Promise.all([
+    fetch('/api/config', { cache: 'no-store' }),
+    fetch('/api/state', { cache: 'no-store' })
+  ]);
+
+  if (!configResponse.ok) {
+    throw new Error(`Request failed with ${configResponse.status}`);
   }
 
-  state.config = applyStoredAgentOrder(await response.json());
+  state.config = applyStoredAgentOrder(await configResponse.json());
   initializeViews(state.config);
+  if (stateResponse.ok) {
+    applyDashboardState(await stateResponse.json());
+  }
   renderCurrentRoute();
+  startDashboardStatePolling();
+  startLiveActivityPolling();
 }
 
 function initializeViews(config) {
   app.textContent = '';
   state.activeHomeAgentId = null;
-  stopActivityMonitor();
   state.views.empty = null;
   state.views.home = null;
   state.views.notFound = null;
@@ -122,7 +143,6 @@ function initializeViews(config) {
   `);
   bindHomeTerminals(state.views.home);
   app.append(state.views.home);
-  startActivityMonitor();
 }
 
 function renderCurrentRoute() {
@@ -181,36 +201,51 @@ function renderShell(config, routeAgent) {
       currentTerminalLink.removeAttribute('title');
     }
   }
-
-  const links = [
-    { href: '/', label: '🏠', active: route.kind === 'home', ariaLabel: 'Home' },
-    ...config.agents.map((agent) => ({
-      href: `/agents/${agent.id}`,
-      label: agent.name,
-      active: route.kind === 'agent' && route.agentId === agent.id,
-      accent: agent.accent,
-      agentId: agent.id,
-      draggable: true
-    }))
-  ];
-
-  nav.innerHTML = links
-    .map(
-      (link) => `
-        <a
-          class="nav-link ${link.active ? 'is-active' : ''} ${link.draggable ? 'is-draggable' : ''}"
-          href="${link.href}"
-          ${link.ariaLabel ? `aria-label="${escapeAttr(link.ariaLabel)}" title="${escapeAttr(link.ariaLabel)}"` : ''}
-          ${link.draggable ? `draggable="true" data-nav-agent-id="${escapeAttr(link.agentId)}"` : ''}
-          ${link.accent ? `style="--agent-accent:${escapeAttr(link.accent)}"` : ''}
-        >
-          ${escapeHtml(link.label)}
-        </a>
-      `
-    )
-    .join('');
-
+  ensureNavLinks(config);
+  updateNavSelection();
   syncNavActivityStatuses();
+}
+
+function ensureNavLinks(config) {
+  const orderKey = config.agents.map((agent) => agent.id).join('|');
+  if (state.nav.orderKey === orderKey && state.nav.homeLink && state.nav.agentLinks.size === config.agents.length) {
+    return;
+  }
+
+  state.nav.orderKey = orderKey;
+  state.nav.agentLinks.clear();
+  nav.textContent = '';
+
+  const homeLink = htmlToElement(`
+    <a class="nav-link" href="/" aria-label="Home" title="Home">🏠</a>
+  `);
+  nav.append(homeLink);
+  state.nav.homeLink = homeLink;
+
+  for (const agent of config.agents) {
+    const link = htmlToElement(`
+      <a
+        class="nav-link is-draggable is-status-syncing"
+        href="/agents/${escapeAttr(agent.id)}"
+        draggable="true"
+        data-nav-agent-id="${escapeAttr(agent.id)}"
+        data-agent-status="syncing"
+        style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}"
+      >
+        ${escapeHtml(agent.name)}
+      </a>
+    `);
+    nav.append(link);
+    state.nav.agentLinks.set(agent.id, link);
+  }
+}
+
+function updateNavSelection() {
+  state.nav.homeLink?.classList.toggle('is-active', route.kind === 'home');
+
+  for (const [agentId, link] of state.nav.agentLinks.entries()) {
+    link.classList.toggle('is-active', route.kind === 'agent' && route.agentId === agentId);
+  }
 }
 
 function ensureNotFoundView(agentId) {
@@ -274,7 +309,7 @@ function renderPreviewCard(agent) {
 
   return `
     <article
-      class="agent-card"
+      class="agent-card is-status-syncing"
       style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}"
       data-agent-card="${escapeAttr(agent.id)}"
     >
@@ -296,13 +331,21 @@ function renderPreviewCard(agent) {
         class="agent-card__terminal-wrap"
         data-home-terminal
         data-agent-id="${escapeAttr(agent.id)}"
+        data-preview-path="${escapeAttr(agent.previewPath)}"
         data-detail-path="${escapeAttr(agent.detailPath)}"
       >
+        <pre
+          class="terminal-snapshot"
+          data-home-snapshot
+          data-snapshot-text
+          aria-label="Snapshot for ${escapeAttr(agent.name)}"
+        ></pre>
         <iframe
-          class="terminal-frame terminal-frame--preview"
+          class="terminal-frame terminal-frame--home"
           title="Interactive terminal for ${escapeAttr(agent.name)}"
           data-home-terminal-frame
           referrerpolicy="no-referrer"
+          hidden
         ></iframe>
       </div>
     </article>
@@ -347,6 +390,17 @@ function handleDocumentClick(event) {
 
   if (state.configModalOpen) {
     return;
+  }
+
+  if (route.kind === 'home') {
+    const homeTerminal = event.target.closest('[data-home-terminal]');
+    if (homeTerminal instanceof HTMLElement && !event.target.closest('a, button')) {
+      const { agentId } = homeTerminal.dataset;
+      if (agentId) {
+        activateHomeTerminal(agentId);
+        return;
+      }
+    }
   }
 
   const link = event.target.closest('a[href]');
@@ -494,6 +548,9 @@ async function saveConfigEditor() {
     initializeViews(state.config);
     state.activeHomeAgentId = nextActiveHomeAgentId;
     renderCurrentRoute();
+    refreshDashboardState().catch((error) => {
+      console.error(error);
+    });
     setConfigStatus('Saved.');
   } finally {
     setConfigEditorBusy(false);
@@ -755,6 +812,8 @@ function syncHomeTerminals(excludedAgentId = null) {
 
   for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
     const frame = terminal.querySelector('[data-home-terminal-frame]');
+    const snapshot = terminal.querySelector('[data-home-snapshot]');
+    const previewPath = terminal.dataset.previewPath;
     const detailPath = terminal.dataset.detailPath;
     const { agentId } = terminal.dataset;
     const card = terminal.closest('[data-agent-card]');
@@ -762,18 +821,36 @@ function syncHomeTerminals(excludedAgentId = null) {
       continue;
     }
 
-    const shouldConnect = agentId !== excludedAgentId && !hasConnectedDetailTerminal(agentId);
-    if (shouldConnect) {
-      if (frame.getAttribute('src') !== detailPath) {
-        frame.src = detailPath;
-        state.activity.byAgent.delete(agentId);
-        setAgentActivityStatus(agentId, 'syncing');
+    const shouldConnect = route.kind === 'home'
+      && agentId === state.activeHomeAgentId
+      && agentId !== excludedAgentId
+      && !hasConnectedDetailTerminal(agentId);
+
+    const desiredSrc = route.kind === 'home' && agentId !== excludedAgentId
+      ? (shouldConnect ? detailPath : (previewPath || detailPath))
+      : '';
+
+    if (desiredSrc) {
+      if (frame.getAttribute('src') !== desiredSrc) {
+        terminal.dataset.frameReady = 'false';
+        frame.src = desiredSrc;
       }
-    } else if (frame.getAttribute('src')) {
-      frame.removeAttribute('src');
+      frame.hidden = false;
+      if (terminal.dataset.frameReady === 'true') {
+        snapshot?.setAttribute('hidden', '');
+      } else {
+        snapshot?.removeAttribute('hidden');
+      }
+    } else {
+      terminal.dataset.frameReady = 'false';
+      if (frame.getAttribute('src')) {
+        frame.removeAttribute('src');
+      }
+      frame.hidden = true;
+      snapshot?.removeAttribute('hidden');
     }
 
-    card.classList.toggle('is-live', shouldConnect && terminal.dataset.agentId === state.activeHomeAgentId);
+    card.classList.toggle('is-live', shouldConnect);
   }
 }
 
@@ -808,9 +885,20 @@ function connectDetailTerminal(agent) {
   }
 }
 
+function activateHomeTerminal(agentId) {
+  if (!agentId) {
+    return;
+  }
+
+  state.activeHomeAgentId = agentId;
+  syncHomeTerminals(route.kind === 'agent' ? route.agentId : null);
+  focusRouteTerminal();
+}
+
 function bindHomeTerminals(homeView) {
   for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
     const frame = terminal.querySelector('[data-home-terminal-frame]');
+    const snapshot = terminal.querySelector('[data-home-snapshot]');
     const card = terminal.closest('[data-agent-card]');
     if (!(frame instanceof HTMLIFrameElement) || !card) {
       continue;
@@ -822,13 +910,12 @@ function bindHomeTerminals(homeView) {
         return;
       }
 
-      state.activeHomeAgentId = agentId;
-      for (const siblingCard of homeView.querySelectorAll('[data-agent-card]')) {
-        siblingCard.classList.toggle('is-live', siblingCard.dataset.agentCard === agentId);
-      }
+      activateHomeTerminal(agentId);
     });
 
     frame.addEventListener('load', () => {
+      terminal.dataset.frameReady = 'true';
+      snapshot?.setAttribute('hidden', '');
       if (route.kind === 'home' && terminal.dataset.agentId === state.activeHomeAgentId) {
         focusTerminalFrame(frame);
       }
@@ -836,111 +923,125 @@ function bindHomeTerminals(homeView) {
   }
 }
 
-function startActivityMonitor() {
-  stopActivityMonitor();
-  updateActivityStatuses();
-  state.activity.intervalId = window.setInterval(updateActivityStatuses, getMonitorConfig().pollMs);
+function startDashboardStatePolling() {
+  stopDashboardStatePolling();
+  scheduleDashboardStatePoll(0);
 }
 
-function stopActivityMonitor() {
-  if (state.activity.intervalId !== null) {
-    window.clearInterval(state.activity.intervalId);
-    state.activity.intervalId = null;
+function startLiveActivityPolling() {
+  stopLiveActivityPolling();
+  scheduleLiveActivityPoll(0);
+}
+
+function stopDashboardStatePolling() {
+  if (state.activity.pollTimeoutId !== null) {
+    window.clearTimeout(state.activity.pollTimeoutId);
+    state.activity.pollTimeoutId = null;
   }
-
-  state.activity.byAgent.clear();
-  state.activity.statusByAgent.clear();
+  state.activity.requestInFlight = false;
 }
 
-function updateActivityStatuses() {
-  if (!state.config?.agents?.length) {
+function stopLiveActivityPolling() {
+  if (state.activity.livePollTimeoutId !== null) {
+    window.clearTimeout(state.activity.livePollTimeoutId);
+    state.activity.livePollTimeoutId = null;
+  }
+}
+
+function handleDocumentVisibilityChange() {
+  if (!state.config) {
     return;
   }
 
-  const now = Date.now();
-  const monitor = getMonitorConfig();
+  scheduleDashboardStatePoll(document.hidden ? getDashboardStatePollDelay() : 0);
+  scheduleLiveActivityPoll(document.hidden ? getDashboardStatePollDelay() : 0);
+}
+
+function scheduleDashboardStatePoll(delayMs = getDashboardStatePollDelay()) {
+  if (state.activity.pollTimeoutId !== null) {
+    window.clearTimeout(state.activity.pollTimeoutId);
+  }
+
+  state.activity.pollTimeoutId = window.setTimeout(() => {
+    refreshDashboardState().catch((error) => {
+      console.error(error);
+      scheduleDashboardStatePoll();
+    });
+  }, Math.max(0, delayMs));
+}
+
+function scheduleLiveActivityPoll(delayMs = getDashboardStatePollDelay()) {
+  if (state.activity.livePollTimeoutId !== null) {
+    window.clearTimeout(state.activity.livePollTimeoutId);
+  }
+
+  state.activity.livePollTimeoutId = window.setTimeout(() => {
+    try {
+      refreshLiveActivityState();
+    } catch (error) {
+      console.error(error);
+    } finally {
+      scheduleLiveActivityPoll();
+    }
+  }, Math.max(0, delayMs));
+}
+
+function getDashboardStatePollDelay() {
+  return document.hidden
+    ? Math.max(hiddenStatePollMs, getMonitorConfig().pollMs * 5)
+    : getMonitorConfig().pollMs;
+}
+
+async function refreshDashboardState() {
+  if (state.activity.requestInFlight) {
+    return;
+  }
+
+  state.activity.requestInFlight = true;
+
+  try {
+    const response = await fetch('/api/state', { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`State request failed with ${response.status}`);
+    }
+
+    applyDashboardState(await response.json());
+  } finally {
+    state.activity.requestInFlight = false;
+    scheduleDashboardStatePoll();
+  }
+}
+
+function applyDashboardState(payload) {
+  const seenIds = new Set();
   let shouldPlayInactiveAlert = false;
 
-  for (const agent of state.config.agents) {
-    const agentId = agent.id;
-    const source = getAgentActivitySource(agentId);
-    const previous = state.activity.byAgent.get(agentId);
-
-    if (!source) {
-      if (!previous) {
-        setAgentActivityStatus(agentId, 'syncing');
-      }
+  for (const agentState of payload?.agents || []) {
+    const agentId = agentState.id;
+    if (!agentId) {
       continue;
     }
 
-    const signature = readVisibleTerminalSignature(source.frame);
-    if (signature === null) {
-      if (!previous || previous.sourceKey !== source.sourceKey) {
-        setAgentActivityStatus(agentId, 'syncing');
-      }
+    seenIds.add(agentId);
+    state.activity.byAgent.set(agentId, agentState);
+    const snapshotText = agentState.snapshot || agentState.error || '';
+    state.activity.snapshotByAgent.set(agentId, snapshotText);
+    const previousStatus = getDisplayedAgentStatus(agentId);
+    const nextStatus = agentState.status || 'syncing';
+    state.activity.serverStatusByAgent.set(agentId, nextStatus);
+    setAgentSnapshotText(agentId, snapshotText);
+    syncDisplayedAgentStatus(agentId);
+    shouldPlayInactiveAlert ||= previousStatus === 'active' && getDisplayedAgentStatus(agentId) === 'waiting';
+  }
+
+  for (const agent of state.config?.agents || []) {
+    if (seenIds.has(agent.id)) {
       continue;
     }
 
-    const nextState = !previous || previous.sourceKey !== source.sourceKey
-      ? {
-          sourceKey: source.sourceKey,
-          signature,
-          lastChangedAt: null,
-          syncChangedAt: null,
-          syncSawChange: false,
-          syncStableSince: now,
-          syncSettledAt: null,
-          status: 'syncing',
-          syncUntil: now + monitor.syncWindowMs
-        }
-      : { ...previous };
-
-    if (!previous || previous.sourceKey !== source.sourceKey) {
-      state.activity.byAgent.set(agentId, nextState);
-      setAgentActivityStatus(agentId, nextState.status);
-      continue;
-    }
-
-    if (nextState.signature !== signature) {
-      nextState.signature = signature;
-      if (nextState.syncUntil) {
-        nextState.syncStableSince = now;
-        if (nextState.syncSettledAt) {
-          nextState.syncChangedAt = now;
-        } else {
-          nextState.syncSawChange = true;
-        }
-      } else {
-        nextState.lastChangedAt = now;
-      }
-    } else if (nextState.syncUntil && !nextState.syncSettledAt && now - nextState.syncStableSince >= monitor.settleWindowMs) {
-      nextState.syncSettledAt = now;
-    }
-
-    if (nextState.syncUntil && now < nextState.syncUntil) {
-      nextState.status = 'syncing';
-      state.activity.byAgent.set(agentId, nextState);
-      setAgentActivityStatus(agentId, nextState.status);
-      continue;
-    }
-
-    if (nextState.syncUntil) {
-      nextState.lastChangedAt = nextState.syncSettledAt
-        ? nextState.syncChangedAt
-        : (nextState.syncSawChange ? nextState.syncStableSince : null);
-      nextState.syncChangedAt = null;
-      nextState.syncSawChange = false;
-      nextState.syncStableSince = null;
-      nextState.syncSettledAt = null;
-      nextState.syncUntil = null;
-    }
-
-    nextState.status = nextState.lastChangedAt && now - nextState.lastChangedAt <= monitor.activeWindowMs
-      ? 'active'
-      : 'waiting';
-    shouldPlayInactiveAlert ||= previous?.status === 'active' && nextState.status === 'waiting';
-    state.activity.byAgent.set(agentId, nextState);
-    setAgentActivityStatus(agentId, nextState.status);
+    state.activity.serverStatusByAgent.set(agent.id, 'syncing');
+    setAgentSnapshotText(agent.id, '');
+    syncDisplayedAgentStatus(agent.id);
   }
 
   if (shouldPlayInactiveAlert) {
@@ -950,6 +1051,84 @@ function updateActivityStatuses() {
 
 function getMonitorConfig() {
   return state.config?.monitor || defaultMonitorConfig;
+}
+
+function setAgentSnapshotText(agentId, snapshot) {
+  const element = state.views.home?.querySelector(
+    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-snapshot-text]`
+  );
+  if (!(element instanceof HTMLElement)) {
+    return;
+  }
+
+  element.textContent = snapshot || '';
+  requestAnimationFrame(() => {
+    element.scrollTop = element.scrollHeight;
+  });
+}
+
+function refreshLiveActivityState() {
+  const now = Date.now();
+  const activeAgentIds = new Set();
+
+  for (const agent of state.config?.agents || []) {
+    const source = getLiveAgentSource(agent.id);
+    if (!source) {
+      continue;
+    }
+
+    activeAgentIds.add(agent.id);
+    const signature = readVisibleTerminalSignature(source.frame);
+    if (signature === null) {
+      continue;
+    }
+
+    const previous = state.activity.liveSampleByAgent.get(agent.id);
+    const nextSample = previous && previous.sourceKey === source.sourceKey
+      ? { ...previous }
+      : { sourceKey: source.sourceKey, signature: null, lastChangedAt: null };
+
+    if (nextSample.signature !== signature) {
+      nextSample.signature = signature;
+      nextSample.lastChangedAt = now;
+    }
+
+    state.activity.liveSampleByAgent.set(agent.id, nextSample);
+    state.activity.liveStatusByAgent.set(
+      agent.id,
+      nextSample.lastChangedAt && now - nextSample.lastChangedAt <= getMonitorConfig().activeWindowMs
+        ? 'active'
+        : 'waiting'
+    );
+    syncDisplayedAgentStatus(agent.id);
+  }
+
+  for (const agent of state.config?.agents || []) {
+    if (activeAgentIds.has(agent.id)) {
+      continue;
+    }
+
+    if (state.activity.liveStatusByAgent.delete(agent.id) || state.activity.liveSampleByAgent.delete(agent.id)) {
+      syncDisplayedAgentStatus(agent.id);
+    }
+  }
+}
+
+function getLiveAgentSource(agentId) {
+  const detailView = state.views.detailById.get(agentId);
+  const detailFrame = detailView?.querySelector('.terminal-frame--detail');
+  if (detailFrame instanceof HTMLIFrameElement && detailFrame.getAttribute('src')) {
+    return { frame: detailFrame, sourceKey: `detail:${agentId}` };
+  }
+
+  const homeFrame = state.views.home?.querySelector(
+    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-home-terminal-frame]`
+  );
+  if (homeFrame instanceof HTMLIFrameElement && homeFrame.getAttribute('src')) {
+    return { frame: homeFrame, sourceKey: `home:${agentId}` };
+  }
+
+  return null;
 }
 
 function readVisibleTerminalSignature(frame) {
@@ -982,21 +1161,18 @@ function readVisibleTerminalSignature(frame) {
   }
 }
 
-function getAgentActivitySource(agentId) {
-  const detailView = state.views.detailById.get(agentId);
-  const detailFrame = detailView?.querySelector('.terminal-frame--detail');
-  if (detailFrame instanceof HTMLIFrameElement && detailFrame.getAttribute('src')) {
-    return { frame: detailFrame, sourceKey: `detail:${agentId}` };
-  }
+function getDisplayedAgentStatus(agentId) {
+  return state.activity.statusByAgent.get(agentId)
+    || state.activity.liveStatusByAgent.get(agentId)
+    || state.activity.serverStatusByAgent.get(agentId)
+    || 'syncing';
+}
 
-  const homeFrame = state.views.home?.querySelector(
-    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-home-terminal-frame]`
-  );
-  if (homeFrame instanceof HTMLIFrameElement && homeFrame.getAttribute('src')) {
-    return { frame: homeFrame, sourceKey: `home:${agentId}` };
-  }
-
-  return null;
+function syncDisplayedAgentStatus(agentId) {
+  const nextStatus = state.activity.liveStatusByAgent.get(agentId)
+    || state.activity.serverStatusByAgent.get(agentId)
+    || 'syncing';
+  setAgentActivityStatus(agentId, nextStatus);
 }
 
 function setAgentActivityStatus(agentId, status) {
@@ -1039,7 +1215,7 @@ function syncNavActivityStatuses() {
 }
 
 function setNavAgentActivityStatus(agentId, status) {
-  const link = nav.querySelector(`[data-nav-agent-id="${CSS.escape(agentId)}"]`);
+  const link = state.nav.agentLinks.get(agentId);
   if (!(link instanceof HTMLElement)) {
     return;
   }
@@ -1140,6 +1316,9 @@ function focusRouteTerminal() {
     ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
     : null;
   const frame = selector ? state.views.home?.querySelector(selector) : null;
+  if (frame instanceof HTMLIFrameElement && !frame.getAttribute('src')) {
+    return;
+  }
   focusTerminalFrame(frame);
 }
 
@@ -1156,7 +1335,7 @@ function retainHomeTerminalFocus(target) {
     ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
     : null;
   const frame = selector ? state.views.home?.querySelector(selector) : null;
-  if (!frame) {
+  if (!(frame instanceof HTMLIFrameElement) || !frame.getAttribute('src')) {
     return;
   }
 
