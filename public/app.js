@@ -757,7 +757,8 @@ function applyStoredAgentOrder(config) {
   }
 
   const agentsById = new Map(config.agents.map((agent) => [agent.id, agent]));
-  const orderedAgents = [];
+  const storedAgents = [];
+  const storedAgentIds = new Set();
 
   for (const agentId of storedOrder) {
     const agent = agentsById.get(agentId);
@@ -765,13 +766,39 @@ function applyStoredAgentOrder(config) {
       continue;
     }
 
-    orderedAgents.push(agent);
-    agentsById.delete(agentId);
+    storedAgents.push(agent);
+    storedAgentIds.add(agentId);
   }
 
+  if (!storedAgents.length) {
+    return config;
+  }
+
+  const unknownAgentsBySlot = new Map();
+  let storedAgentsSeenInConfig = 0;
+
   for (const agent of config.agents) {
-    if (agentsById.has(agent.id)) {
-      orderedAgents.push(agent);
+    if (storedAgentIds.has(agent.id)) {
+      storedAgentsSeenInConfig += 1;
+      continue;
+    }
+
+    const slot = storedAgentsSeenInConfig;
+    const bucket = unknownAgentsBySlot.get(slot) || [];
+    bucket.push(agent);
+    unknownAgentsBySlot.set(slot, bucket);
+  }
+
+  const orderedAgents = [];
+
+  for (let index = 0; index <= storedAgents.length; index += 1) {
+    const unknownAgents = unknownAgentsBySlot.get(index);
+    if (unknownAgents) {
+      orderedAgents.push(...unknownAgents);
+    }
+
+    if (index < storedAgents.length) {
+      orderedAgents.push(storedAgents[index]);
     }
   }
 
