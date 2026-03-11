@@ -128,6 +128,36 @@ What it does:
 - Configures tmux/ttyd for RGB-capable browser terminals
 - Prints dashboard JSON entries and an `ssh -L` command you can run locally
 
+## Claude worker
+
+There is also a worker-side Claude transcript service at `scripts/agent_watch_claude_worker.py`.
+
+It reads Claude Code's local JSONL transcripts from `~/.claude/projects`, persists:
+
+- a raw per-file cursor
+- normalized session state
+- a derived event feed
+
+and serves them over HTTP for the dashboard or other tooling.
+
+Example:
+
+```bash
+python3 scripts/agent_watch_claude_worker.py \
+  --host-id saketh-dev-2 \
+  --port 7811
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /state`
+- `GET /tools`
+- `GET /tools/claude/current`
+- `GET /tools/claude/events?since=0`
+
+State is stored under `~/.local/state/agent-watch/worker/<host-id>/claude/`.
+
 ## Custom TLS
 
 To use a trusted cert instead of the generated local cert:

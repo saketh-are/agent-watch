@@ -287,6 +287,103 @@ app.get('/api/state', (_req, res) => {
   }
 });
 
+app.get('/api/agents/:id/claude/current', async (req, res) => {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+    return;
+  }
+
+  const agent = config.agents.find((item) => item.id === req.params.id);
+  if (!agent) {
+    res.status(404).json({ error: `Unknown agent "${req.params.id}"` });
+    return;
+  }
+
+  if (!agent.claudeWorkerTarget) {
+    res.status(404).json({ error: `Claude worker is not configured for "${req.params.id}"` });
+    return;
+  }
+
+  try {
+    const targetUrl = new URL(agent.claudeWorkerTarget);
+    targetUrl.pathname = joinTargetPath(targetUrl.pathname, '/tools/claude/current');
+    const response = await fetch(targetUrl, {
+      headers: {
+        accept: 'application/json',
+        ...(agent.headers || {})
+      }
+    });
+    const payload = await response.text();
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json; charset=utf-8')
+      .setHeader('cache-control', 'no-store')
+      .send(payload);
+  } catch (error) {
+    res.status(502).json({
+      error: 'Could not load Claude worker state',
+      detail: error.message
+    });
+  }
+});
+
+app.post('/api/agents/:id/claude/prompt', async (req, res) => {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+    return;
+  }
+
+  const agent = config.agents.find((item) => item.id === req.params.id);
+  if (!agent) {
+    res.status(404).json({ error: `Unknown agent "${req.params.id}"` });
+    return;
+  }
+
+  if (!agent.claudeWorkerTarget) {
+    res.status(404).json({ error: `Claude worker is not configured for "${req.params.id}"` });
+    return;
+  }
+
+  try {
+    const targetUrl = new URL(agent.claudeWorkerTarget);
+    targetUrl.pathname = joinTargetPath(targetUrl.pathname, '/tools/claude/prompt');
+    const response = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        ...(agent.headers || {})
+      },
+      body: JSON.stringify({
+        text: String(req.body?.text || '')
+      })
+    });
+    const payload = await response.text();
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json; charset=utf-8')
+      .setHeader('cache-control', 'no-store')
+      .send(payload);
+  } catch (error) {
+    res.status(502).json({
+      error: 'Could not submit Claude prompt',
+      detail: error.message
+    });
+  }
+});
+
 app.get('/api/config-file', (_req, res) => {
   try {
     const { raw } = readConfigFile();
@@ -461,7 +558,13 @@ function buildPublicConfig(config) {
         accent: agent.accent || '#d06d32',
         source: agent.sourceLabel || detailUpstream.host,
         previewPath: `/terminal/${encodeURIComponent(agent.id)}/preview/`,
-        detailPath: `/terminal/${encodeURIComponent(agent.id)}/detail/`
+        detailPath: `/terminal/${encodeURIComponent(agent.id)}/detail/`,
+        claudeCurrentPath: agent.claudeWorkerTarget
+          ? `/api/agents/${encodeURIComponent(agent.id)}/claude/current`
+          : null,
+        claudePromptPath: agent.claudeWorkerTarget
+          ? `/api/agents/${encodeURIComponent(agent.id)}/claude/prompt`
+          : null
       };
     })
   };
@@ -502,6 +605,9 @@ function validateAgents(agents) {
     }
     if (agent.snapshotTarget) {
       new URL(agent.snapshotTarget);
+    }
+    if (agent.claudeWorkerTarget) {
+      new URL(agent.claudeWorkerTarget);
     }
   }
 }

@@ -1,5 +1,6 @@
 const app = document.querySelector('#app');
 const nav = document.querySelector('#site-nav');
+const modeSwitcher = document.querySelector('#mode-switcher');
 const siteTitle = document.querySelector('#site-title');
 const siteSubtitle = document.querySelector('#site-subtitle');
 const currentTerminalLink = document.querySelector('#current-terminal-link');
@@ -21,7 +22,7 @@ const defaultMonitorConfig = Object.freeze({
   ignoredBottomRows: 1
 });
 
-let route = getRoute(window.location.pathname);
+let route = getRoute(window.location.pathname, window.location.search);
 
 const state = {
   config: null,
@@ -37,6 +38,16 @@ const state = {
     liveSampleByAgent: new Map(),
     statusByAgent: new Map(),
     snapshotByAgent: new Map()
+  },
+  chat: {
+    pollTimeoutId: null,
+    requestInFlight: false,
+    activeAgentId: null,
+    byAgent: new Map(),
+    filterByAgent: new Map(),
+    sendingByAgent: new Set(),
+    summaryOpenByAgent: new Map(),
+    didInitialScrollByAgent: new Map()
   },
   audio: {
     context: null,
@@ -73,11 +84,13 @@ boot().catch((error) => {
 });
 
 window.addEventListener('popstate', () => {
-  route = getRoute(window.location.pathname);
+  route = getRoute(window.location.pathname, window.location.search);
   renderCurrentRoute();
 });
 
 document.addEventListener('click', handleDocumentClick);
+document.addEventListener('submit', handleDocumentSubmit);
+document.addEventListener('keydown', handleComposerKeydown);
 document.addEventListener('visibilitychange', handleDocumentVisibilityChange);
 nav.addEventListener('dragstart', handleNavDragStart);
 nav.addEventListener('dragover', handleNavDragOver);
@@ -124,6 +137,7 @@ async function boot() {
 function initializeViews(config) {
   app.textContent = '';
   state.activeHomeAgentId = null;
+  state.chat.didInitialScrollByAgent.clear();
   state.views.empty = null;
   state.views.home = null;
   state.views.notFound = null;
@@ -169,12 +183,21 @@ function renderCurrentRoute() {
 
   if (route.kind === 'agent') {
     syncHomeTerminals(routeAgent.id);
-    connectDetailTerminal(routeAgent);
-    showOnly(ensureDetailView(routeAgent));
+    const detailView = ensureDetailView(routeAgent);
+    syncAgentDetailMode(routeAgent, detailView);
+    if (getAgentViewMode(routeAgent) === 'claude') {
+      disconnectDetailTerminals();
+      startClaudeChatPolling(routeAgent);
+    } else {
+      stopClaudeChatPolling();
+      connectDetailTerminal(routeAgent);
+    }
+    showOnly(detailView);
     focusRouteTerminal();
     return;
   }
 
+  stopClaudeChatPolling();
   disconnectDetailTerminals();
   syncHomeTerminals();
   showOnly(state.views.home);
@@ -202,8 +225,44 @@ function renderShell(config, routeAgent) {
     }
   }
   ensureNavLinks(config);
+  renderModeSwitcher(routeAgent);
   updateNavSelection();
   syncNavActivityStatuses();
+}
+
+function renderModeSwitcher(routeAgent) {
+  if (!(modeSwitcher instanceof HTMLElement)) {
+    return;
+  }
+
+  if (!routeAgent) {
+    modeSwitcher.hidden = true;
+    modeSwitcher.textContent = '';
+    return;
+  }
+
+  const supportsClaude = Boolean(routeAgent.claudeCurrentPath);
+  const mode = getAgentViewMode(routeAgent);
+  const byobuHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=byobu`;
+  const claudeHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=claude`;
+
+  modeSwitcher.hidden = false;
+  modeSwitcher.innerHTML = supportsClaude
+    ? `
+      <a class="mode-switcher__link ${mode === 'claude' ? 'is-active' : ''}" href="${escapeAttr(claudeHref)}" title="Claude" aria-label="Claude">💬</a>
+      <a class="mode-switcher__link ${mode === 'byobu' ? 'is-active' : ''}" href="${escapeAttr(byobuHref)}" title="Byobu" aria-label="Byobu">🖥️</a>
+    `
+    : `
+      <a class="mode-switcher__link is-active" href="${escapeAttr(byobuHref)}" title="Byobu" aria-label="Byobu">🖥️</a>
+    `;
+}
+
+function getAgentViewMode(agent) {
+  if (!agent?.claudeCurrentPath) {
+    return 'byobu';
+  }
+
+  return route.view === 'claude' ? 'claude' : 'byobu';
 }
 
 function ensureNavLinks(config) {
@@ -353,6 +412,64 @@ function renderPreviewCard(agent) {
 }
 
 function renderAgentDetail(agent) {
+  if (agent.claudeCurrentPath) {
+    return `
+      <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
+        <section class="detail-panel detail-panel--chat" data-detail-panel="claude">
+          <section class="chat-page" data-chat-page data-agent-id="${escapeAttr(agent.id)}">
+            <header class="chat-page__header">
+              <div>
+                <p class="eyebrow">Claude</p>
+                <h2>Session Transcript</h2>
+              </div>
+              <div class="chat-page__actions">
+                <button class="chat-toggle" type="button" data-chat-summary-toggle data-agent-id="${escapeAttr(agent.id)}">Show sidebar</button>
+                <span class="agent-status is-syncing" data-chat-status>Syncing</span>
+              </div>
+            </header>
+            <section class="chat-session-meta" data-chat-meta>
+              <span>Waiting for session metadata…</span>
+            </section>
+            <section class="chat-page__layout">
+              <div class="chat-page__main">
+                <div class="chat-filters" data-chat-filters>
+                  ${renderChatFilterButton(agent.id, 'all', 'All')}
+                  ${renderChatFilterButton(agent.id, 'prompts', 'Prompts')}
+                  ${renderChatFilterButton(agent.id, 'tools', 'Tool calls')}
+                  ${renderChatFilterButton(agent.id, 'errors', 'Errors')}
+                </div>
+                <div class="chat-page__body" data-chat-body>
+                  <p class="chat-page__empty">Connecting to the Claude worker…</p>
+                </div>
+                <form class="chat-compose" data-chat-compose data-agent-id="${escapeAttr(agent.id)}">
+                  <textarea
+                    class="chat-compose__input"
+                    data-chat-input
+                    rows="3"
+                    placeholder="Send a new message to Claude…"
+                  ></textarea>
+                </form>
+              </div>
+              <aside class="chat-sidebar" data-chat-summary>
+                <p class="chat-page__empty">Waiting for session summary…</p>
+              </aside>
+            </section>
+          </section>
+        </section>
+        <section class="detail-panel detail-panel--terminal" data-detail-panel="byobu" hidden>
+          <section class="detail-terminal">
+            <iframe
+              class="terminal-frame terminal-frame--detail"
+              title="Interactive terminal for ${escapeAttr(agent.name)}"
+              data-detail-path="${escapeAttr(agent.detailPath)}"
+              referrerpolicy="no-referrer"
+            ></iframe>
+          </section>
+        </section>
+      </section>
+    `;
+  }
+
   return `
     <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
       <section class="detail-terminal">
@@ -365,6 +482,69 @@ function renderAgentDetail(agent) {
       </section>
     </section>
   `;
+}
+
+function syncAgentDetailMode(agent, view) {
+  if (!agent?.claudeCurrentPath || !(view instanceof HTMLElement)) {
+    return;
+  }
+
+  const mode = getAgentViewMode(agent);
+  const chatPanel = view.querySelector('[data-detail-panel="claude"]');
+  const byobuPanel = view.querySelector('[data-detail-panel="byobu"]');
+  chatPanel?.toggleAttribute('hidden', mode !== 'claude');
+  byobuPanel?.toggleAttribute('hidden', mode !== 'byobu');
+}
+
+function renderChatFilterButton(agentId, value, label) {
+  return `
+    <button
+      class="chat-filter"
+      type="button"
+      data-chat-filter="${escapeAttr(value)}"
+      data-agent-id="${escapeAttr(agentId)}"
+    >
+      ${escapeHtml(label)}
+    </button>
+  `;
+}
+
+function getChatFilter(agentId) {
+  return state.chat.filterByAgent.get(agentId) || 'all';
+}
+
+function isChatSummaryOpen(agentId) {
+  return state.chat.summaryOpenByAgent.get(agentId) || false;
+}
+
+function applyChatFilter(agentId, turns) {
+  const filter = getChatFilter(agentId);
+  if (filter === 'tools') {
+    return turns.filter((turn) => (turn.toolUses || []).length || (turn.toolResults || []).length);
+  }
+  if (filter === 'errors') {
+    return turns.filter((turn) => turn.error || (turn.toolResults || []).some((item) => item.isError));
+  }
+  return turns;
+}
+
+function syncChatFilters(agentId) {
+  const view = state.views.detailById.get(agentId);
+  const filter = getChatFilter(agentId);
+  for (const button of view?.querySelectorAll('[data-chat-filter]') || []) {
+    button.classList.toggle('is-active', button.dataset.chatFilter === filter);
+  }
+}
+
+function syncChatSummaryVisibility(agentId) {
+  const view = state.views.detailById.get(agentId);
+  const layout = view?.querySelector('.chat-page__layout');
+  const toggle = view?.querySelector('[data-chat-summary-toggle]');
+  const isOpen = isChatSummaryOpen(agentId);
+  layout?.classList.toggle('is-summary-open', isOpen);
+  if (toggle instanceof HTMLButtonElement) {
+    toggle.textContent = isOpen ? 'Hide sidebar' : 'Show sidebar';
+  }
 }
 
 function renderEmptySetup() {
@@ -403,6 +583,26 @@ function handleDocumentClick(event) {
     }
   }
 
+  const filterButton = event.target.closest('[data-chat-filter]');
+  if (filterButton instanceof HTMLButtonElement) {
+    const { agentId, chatFilter } = filterButton.dataset;
+    if (agentId && chatFilter) {
+      state.chat.filterByAgent.set(agentId, chatFilter);
+      renderClaudeChat(agentId, state.chat.byAgent.get(agentId));
+      return;
+    }
+  }
+
+  const summaryToggle = event.target.closest('[data-chat-summary-toggle]');
+  if (summaryToggle instanceof HTMLButtonElement) {
+    const { agentId } = summaryToggle.dataset;
+    if (agentId) {
+      state.chat.summaryOpenByAgent.set(agentId, !isChatSummaryOpen(agentId));
+      syncChatSummaryVisibility(agentId);
+      return;
+    }
+  }
+
   const link = event.target.closest('a[href]');
   if (!link || !shouldHandleNavigation(event, link)) {
     retainHomeTerminalFocus(event.target);
@@ -416,6 +616,52 @@ function handleDocumentClick(event) {
 
   event.preventDefault();
   navigateTo(link.href);
+}
+
+function handleDocumentSubmit(event) {
+  if (!(event.target instanceof HTMLFormElement)) {
+    return;
+  }
+
+  const form = event.target.closest('[data-chat-compose]');
+  if (!(form instanceof HTMLFormElement)) {
+    return;
+  }
+
+  event.preventDefault();
+  const { agentId } = form.dataset;
+  if (!agentId) {
+    return;
+  }
+
+  submitClaudePrompt(agentId, form).catch((error) => {
+    console.error(error);
+  });
+}
+
+function handleComposerKeydown(event) {
+  if (!(event.target instanceof HTMLTextAreaElement) || !event.target.matches('[data-chat-input]')) {
+    return;
+  }
+
+  if (event.key !== 'Enter' || event.shiftKey) {
+    return;
+  }
+
+  const form = event.target.closest('[data-chat-compose]');
+  if (!(form instanceof HTMLFormElement)) {
+    return;
+  }
+
+  event.preventDefault();
+  const { agentId } = form.dataset;
+  if (!agentId) {
+    return;
+  }
+
+  submitClaudePrompt(agentId, form).catch((error) => {
+    console.error(error);
+  });
 }
 
 function shouldHandleNavigation(event, link) {
@@ -453,7 +699,7 @@ function navigateTo(href) {
   }
 
   history.pushState({}, '', nextPath);
-  route = getRoute(url.pathname);
+  route = getRoute(url.pathname, url.search);
   renderCurrentRoute();
 }
 
@@ -960,6 +1206,16 @@ function startLiveActivityPolling() {
   scheduleLiveActivityPoll(0);
 }
 
+function startClaudeChatPolling(agent) {
+  if (!agent?.claudeCurrentPath) {
+    stopClaudeChatPolling();
+    return;
+  }
+
+  state.chat.activeAgentId = agent.id;
+  scheduleClaudeChatPoll(0);
+}
+
 function stopDashboardStatePolling() {
   if (state.activity.pollTimeoutId !== null) {
     window.clearTimeout(state.activity.pollTimeoutId);
@@ -975,6 +1231,16 @@ function stopLiveActivityPolling() {
   }
 }
 
+function stopClaudeChatPolling() {
+  if (state.chat.pollTimeoutId !== null) {
+    window.clearTimeout(state.chat.pollTimeoutId);
+    state.chat.pollTimeoutId = null;
+  }
+
+  state.chat.requestInFlight = false;
+  state.chat.activeAgentId = null;
+}
+
 function handleDocumentVisibilityChange() {
   if (!state.config) {
     return;
@@ -982,6 +1248,7 @@ function handleDocumentVisibilityChange() {
 
   scheduleDashboardStatePoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleLiveActivityPoll(document.hidden ? getDashboardStatePollDelay() : 0);
+  scheduleClaudeChatPoll(document.hidden ? getDashboardStatePollDelay() : 0);
 }
 
 function scheduleDashboardStatePoll(delayMs = getDashboardStatePollDelay()) {
@@ -1013,6 +1280,23 @@ function scheduleLiveActivityPoll(delayMs = getDashboardStatePollDelay()) {
   }, Math.max(0, delayMs));
 }
 
+function scheduleClaudeChatPoll(delayMs = getDashboardStatePollDelay()) {
+  if (state.chat.activeAgentId === null) {
+    return;
+  }
+
+  if (state.chat.pollTimeoutId !== null) {
+    window.clearTimeout(state.chat.pollTimeoutId);
+  }
+
+  state.chat.pollTimeoutId = window.setTimeout(() => {
+    refreshClaudeChatState().catch((error) => {
+      console.error(error);
+      scheduleClaudeChatPoll();
+    });
+  }, Math.max(0, delayMs));
+}
+
 function getDashboardStatePollDelay() {
   return document.hidden
     ? Math.max(hiddenStatePollMs, getMonitorConfig().pollMs * 5)
@@ -1036,6 +1320,77 @@ async function refreshDashboardState() {
   } finally {
     state.activity.requestInFlight = false;
     scheduleDashboardStatePoll();
+  }
+}
+
+async function refreshClaudeChatState() {
+  const agentId = state.chat.activeAgentId;
+  const agent = agentId
+    ? state.config?.agents.find((item) => item.id === agentId)
+    : null;
+
+  if (!agent?.claudeCurrentPath || state.chat.requestInFlight) {
+    return;
+  }
+
+  state.chat.requestInFlight = true;
+
+  try {
+    const response = await fetch(agent.claudeCurrentPath, { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Claude request failed with ${response.status}`);
+    }
+    state.chat.byAgent.set(agent.id, payload);
+    renderClaudeChat(agent.id, payload);
+  } catch (error) {
+    renderClaudeChat(agent.id, { error: error.message });
+  } finally {
+    state.chat.requestInFlight = false;
+    scheduleClaudeChatPoll();
+  }
+}
+
+async function submitClaudePrompt(agentId, form) {
+  const agent = state.config?.agents.find((item) => item.id === agentId);
+  const input = form.querySelector('[data-chat-input]');
+  if (!agent?.claudePromptPath || !(input instanceof HTMLTextAreaElement)) {
+    return;
+  }
+
+  const text = input.value.trim();
+  if (!text || state.chat.sendingByAgent.has(agentId)) {
+    return;
+  }
+
+  state.chat.sendingByAgent.add(agentId);
+  input.disabled = true;
+  input.placeholder = 'Sending…';
+
+  try {
+    const response = await fetch(agent.claudePromptPath, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ text })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Prompt request failed with ${response.status}`);
+    }
+
+    input.value = '';
+    refreshClaudeChatState().catch((error) => {
+      console.error(error);
+    });
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    state.chat.sendingByAgent.delete(agentId);
+    input.disabled = false;
+    input.placeholder = 'Send a new message to Claude…';
+    input.focus();
   }
 }
 
@@ -1258,6 +1613,200 @@ function setNavAgentActivityStatus(agentId, status) {
   }
 }
 
+function renderClaudeChat(agentId, payload) {
+  const view = state.views.detailById.get(agentId);
+  const status = view?.querySelector('[data-chat-status]');
+  const body = view?.querySelector('[data-chat-body]');
+  const meta = view?.querySelector('[data-chat-meta]');
+  const summary = view?.querySelector('[data-chat-summary]');
+  if (!(status instanceof HTMLElement) || !(body instanceof HTMLElement) || !(meta instanceof HTMLElement) || !(summary instanceof HTMLElement)) {
+    return;
+  }
+
+  syncChatFilters(agentId);
+  syncChatSummaryVisibility(agentId);
+
+  if (payload?.error) {
+    status.textContent = 'Error';
+    status.className = 'agent-status is-waiting';
+    meta.innerHTML = '<span>Claude worker unavailable</span>';
+    summary.innerHTML = `<p class="chat-page__empty">${escapeHtml(payload.error)}</p>`;
+    body.innerHTML = `<p class="chat-page__empty">${escapeHtml(payload.error)}</p>`;
+    return;
+  }
+
+  const session = payload?.session || null;
+  if (!session) {
+    status.textContent = 'Idle';
+    status.className = 'agent-status is-syncing';
+    meta.innerHTML = '<span>No active Claude session</span>';
+    summary.innerHTML = '<p class="chat-page__empty">No session summary yet.</p>';
+    body.innerHTML = '<p class="chat-page__empty">No Claude session transcript is available yet.</p>';
+    return;
+  }
+
+  const statusText = {
+    running: 'Running',
+    waiting: 'Waiting',
+    error: 'Error'
+  }[session.status] || 'Syncing';
+  status.textContent = statusText;
+  status.className = `agent-status ${session.status === 'running' ? 'is-active' : session.status === 'error' ? 'is-waiting' : 'is-syncing'}`;
+  meta.innerHTML = renderChatMeta(session);
+  summary.innerHTML = renderChatSummary(session);
+
+  const filter = getChatFilter(agentId);
+  const turns = applyChatFilter(agentId, Array.isArray(session.turns) ? session.turns : []);
+  body.innerHTML = turns.length
+    ? turns.map((turn) => renderClaudeTurn(turn, filter)).join('')
+    : `<p class="chat-page__empty">No turns match the <code>${escapeHtml(filter)}</code> filter.</p>`;
+  if (!state.chat.didInitialScrollByAgent.get(agentId)) {
+    requestAnimationFrame(() => {
+      body.scrollTop = body.scrollHeight;
+      state.chat.didInitialScrollByAgent.set(agentId, true);
+    });
+  }
+}
+
+function renderClaudeTurn(turn, filter) {
+  const showToolSections = filter !== 'prompts';
+  const toolList = Array.isArray(turn.toolUses) && turn.toolUses.length && showToolSections
+    ? `
+      <details class="chat-turn__section" open>
+        <summary>Tool Calls (${turn.toolUses.length})</summary>
+        <div class="chat-turn__tools">
+          ${turn.toolUses.map(renderToolUse).join('')}
+        </div>
+      </details>
+    `
+    : '';
+  const toolResults = Array.isArray(turn.toolResults) && turn.toolResults.length && showToolSections
+    ? `
+      <details class="chat-turn__section">
+        <summary>Tool Results (${turn.toolResults.length})</summary>
+        <pre class="chat-turn__tool-results">${escapeHtml(turn.toolResults.map((item) => item.stdout || item.text || '').filter(Boolean).join('\n\n'))}</pre>
+      </details>
+    `
+    : '';
+  const assistantText = turn.assistantText || turn.error || '';
+
+  return `
+    <article class="chat-turn ${turn.error ? 'chat-turn--error' : ''}">
+      <header class="chat-turn__header">
+        <span class="chat-turn__label">You</span>
+        <time>${escapeHtml(formatTimestamp(turn.startedAt))}</time>
+      </header>
+      <pre class="chat-turn__prompt">${escapeHtml(turn.userText || '')}</pre>
+      ${toolList}
+      ${toolResults}
+      <header class="chat-turn__header">
+        <span class="chat-turn__label">Claude</span>
+      </header>
+      <pre class="chat-turn__response">${escapeHtml(assistantText || 'No assistant response yet.')}</pre>
+    </article>
+  `;
+}
+
+function renderToolUse(tool) {
+  const input = tool.input?.command || tool.input?.description || JSON.stringify(tool.input || {});
+  return `
+    <article class="chat-tool-card">
+      <div class="chat-tool-card__name">${escapeHtml(tool.name || 'Tool')}</div>
+      <pre class="chat-tool-card__input">${escapeHtml(input)}</pre>
+    </article>
+  `;
+}
+
+function renderChatMeta(session) {
+  return `
+    <span>${escapeHtml(session.cwd || 'unknown cwd')}</span>
+    <span>${escapeHtml(session.gitBranch || 'no git branch')}</span>
+    <span>${escapeHtml(session.sessionId || 'unknown session')}</span>
+    <span>${escapeHtml(formatTimestamp(session.updatedAt))}</span>
+  `;
+}
+
+function renderChatSummary(session) {
+  const summary = buildChatSummary(session);
+  return `
+    <section class="chat-summary-card">
+      <p class="eyebrow">Latest Prompt</p>
+      <p class="chat-summary-card__copy">${escapeHtml(summary.latestPrompt)}</p>
+    </section>
+    <section class="chat-summary-card">
+      <p class="eyebrow">Latest Tools</p>
+      ${summary.tools.length
+        ? `<div class="chat-summary-card__chips">${summary.tools.map((tool) => `<code>${escapeHtml(tool)}</code>`).join('')}</div>`
+        : '<p class="chat-page__empty">No tool calls recorded yet.</p>'}
+    </section>
+    <section class="chat-summary-card">
+      <p class="eyebrow">Latest Files</p>
+      ${summary.files.length
+        ? `<div class="chat-summary-card__list">${summary.files.map((filePath) => `<code>${escapeHtml(filePath)}</code>`).join('')}</div>`
+        : '<p class="chat-page__empty">No file paths inferred yet.</p>'}
+    </section>
+    <section class="chat-summary-card">
+      <p class="eyebrow">Errors</p>
+      <p class="chat-summary-card__copy">${summary.errorCount ? `${summary.errorCount} recent error turn${summary.errorCount === 1 ? '' : 's'}` : 'No recent errors'}</p>
+    </section>
+  `;
+}
+
+function buildChatSummary(session) {
+  const turns = Array.isArray(session.turns) ? session.turns : [];
+  const latestTurn = turns[turns.length - 1] || null;
+  const tools = [];
+  const files = [];
+  const seenTools = new Set();
+  const seenFiles = new Set();
+
+  for (const turn of turns.slice().reverse()) {
+    for (const tool of turn.toolUses || []) {
+      const name = tool.name || 'Tool';
+      if (!seenTools.has(name)) {
+        seenTools.add(name);
+        tools.push(name);
+      }
+      for (const filePath of extractFileCandidates(tool.input?.command || '')) {
+        if (!seenFiles.has(filePath)) {
+          seenFiles.add(filePath);
+          files.push(filePath);
+        }
+      }
+    }
+  }
+
+  return {
+    latestPrompt: latestTurn?.userText || 'No prompt yet',
+    tools: tools.slice(0, 6),
+    files: files.slice(0, 6),
+    errorCount: turns.filter((turn) => turn.error || (turn.toolResults || []).some((item) => item.isError)).length
+  };
+}
+
+function extractFileCandidates(command) {
+  const matches = String(command || '').match(/(?:^|\s)(~?\/[\w./-]+|\.?\.?\/[\w./-]+)/g) || [];
+  return matches.map((value) => value.trim());
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return 'now';
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat([], {
+    hour: 'numeric',
+    minute: '2-digit',
+    month: 'short',
+    day: 'numeric'
+  }).format(date);
+}
+
 function armInactiveAlertAudio() {
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!AudioContextClass) {
@@ -1333,6 +1882,10 @@ function htmlToElement(markup) {
 
 function focusRouteTerminal() {
   if (route.kind === 'agent') {
+    const agent = state.config?.agents.find((item) => item.id === route.agentId);
+    if (getAgentViewMode(agent) === 'claude') {
+      return;
+    }
     const activeView = state.views.detailById.get(route.agentId);
     const frame = activeView?.querySelector('.terminal-frame--detail');
     focusTerminalFrame(frame);
@@ -1423,10 +1976,16 @@ function focusTerminalFrame(frame) {
   requestAnimationFrame(tryFocus);
 }
 
-function getRoute(pathname) {
+function getRoute(pathname, search = '') {
   const agentMatch = pathname.match(/^\/agents\/([^/]+)\/?$/);
   if (agentMatch) {
-    return { kind: 'agent', agentId: decodeURIComponent(agentMatch[1]) };
+    const params = new URLSearchParams(search || '');
+    const view = params.get('view');
+    return {
+      kind: 'agent',
+      agentId: decodeURIComponent(agentMatch[1]),
+      view: view === 'byobu' || view === 'claude' ? view : null
+    };
   }
 
   return { kind: 'home' };
