@@ -218,8 +218,8 @@ app.post('/login', (req, res) => {
   }
 
   const nextPath = normalizeNextPath(req.body?.next);
-  const username = String(req.body?.login_user ?? req.body?.username ?? '');
-  const password = String(req.body?.login_secret ?? req.body?.password ?? '');
+  const username = String(req.body?.username || '');
+  const password = String(req.body?.password || '');
 
   if (username !== auth.user || password !== auth.password) {
     res
@@ -1303,17 +1303,9 @@ function renderLoginPage({ next, error = '' }) {
         background: rgba(255, 255, 255, 0.72);
       }
 
-      .login-form input[data-secret="true"] {
-        -webkit-text-security: disc;
-      }
-
       .login-form input:focus {
         outline: 2px solid rgba(183, 101, 47, 0.34);
         border-color: rgba(183, 101, 47, 0.5);
-      }
-
-      .login-form input[readonly] {
-        cursor: text;
       }
 
       .login-form button {
@@ -1334,35 +1326,19 @@ function renderLoginPage({ next, error = '' }) {
       <h1>Sign in</h1>
       <p class="login-card__copy">Sign in to view your agent dashboard.</p>
       ${errorMarkup}
-      <form class="login-form" method="post" action="/login" autocomplete="off" autocapitalize="off">
+      <form class="login-form" method="post" action="/login">
         <input type="hidden" name="next" value="${escapeHtml(next)}">
         <label>
           Username
-          <input name="login_user" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" readonly required>
+          <input name="username" type="text" autocomplete="username" autocapitalize="off" autofocus required>
         </label>
         <label>
           Password
-          <input name="login_secret" type="text" inputmode="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-secret="true" readonly required>
+          <input name="password" type="password" autocomplete="current-password" required>
         </label>
         <button type="submit">Open Agent Watch</button>
       </form>
     </main>
-    <script>
-      (() => {
-        const unlock = (event) => {
-          const input = event.currentTarget;
-          if (!input.hasAttribute('readonly')) return;
-          input.removeAttribute('readonly');
-          requestAnimationFrame(() => input.focus());
-        };
-
-        document.querySelectorAll('.login-form input').forEach((input) => {
-          input.addEventListener('pointerdown', unlock, { passive: true });
-          input.addEventListener('touchstart', unlock, { passive: true });
-          input.addEventListener('focus', unlock);
-        });
-      })();
-    </script>
   </body>
 </html>`;
 }
