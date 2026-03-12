@@ -26,7 +26,6 @@ let route = getRoute(window.location.pathname, window.location.search);
 
 const state = {
   config: null,
-  activeHomeAgentId: null,
   configModalOpen: false,
   activity: {
     pollTimeoutId: null,
@@ -76,7 +75,8 @@ const state = {
     home: null,
     notFound: null,
     detailById: new Map()
-  }
+  },
+  routeTerminalFocusToken: 0
 };
 
 boot().catch((error) => {
@@ -143,8 +143,8 @@ async function boot() {
 
 function initializeViews(config) {
   app.textContent = '';
-  state.activeHomeAgentId = null;
   state.chat.didInitialScrollByAgent.clear();
+  state.history.didInitialScrollByAgent.clear();
   state.views.empty = null;
   state.views.home = null;
   state.views.notFound = null;
@@ -159,11 +159,14 @@ function initializeViews(config) {
 
   state.views.home = htmlToElement(`
     <section class="stack route-view route-view--home is-active" data-route-view="home" aria-hidden="false">
-      ${config.agents.map(renderPreviewCard).join('')}
+      ${renderHomePlaceholder()}
     </section>
   `);
-  bindHomeTerminals(state.views.home);
   app.append(state.views.home);
+
+  for (const agent of config.agents) {
+    ensureDetailView(agent);
+  }
 }
 
 function renderCurrentRoute() {
@@ -189,34 +192,31 @@ function renderCurrentRoute() {
   }
 
   if (route.kind === 'agent') {
-    syncHomeTerminals(routeAgent.id);
     const detailView = ensureDetailView(routeAgent);
     syncAgentDetailMode(routeAgent, detailView);
+    syncDetailTerminalConnections(routeAgent);
     const mode = getAgentViewMode(routeAgent);
     if (mode === 'claude') {
-      disconnectDetailTerminals();
       stopHistoryPolling();
       startClaudeChatPolling(routeAgent);
     } else if (mode === 'history') {
-      disconnectDetailTerminals();
       stopClaudeChatPolling();
       startHistoryPolling(routeAgent);
     } else {
       stopClaudeChatPolling();
       stopHistoryPolling();
-      connectDetailTerminal(routeAgent);
     }
     showOnly(detailView);
-    focusRouteTerminal();
+    if (mode === 'byobu') {
+      focusRouteTerminal();
+    }
     return;
   }
 
   stopClaudeChatPolling();
   stopHistoryPolling();
-  disconnectDetailTerminals();
-  syncHomeTerminals();
+  syncDetailTerminalConnections(null);
   showOnly(state.views.home);
-  focusRouteTerminal();
 }
 
 function renderShell(config, routeAgent) {
@@ -293,6 +293,24 @@ function getAgentViewMode(agent) {
   return route.view === 'claude' ? 'claude' : 'byobu';
 }
 
+function getActiveByobuAgentId() {
+  if (route.kind !== 'agent') {
+    return null;
+  }
+
+  const agent = state.config?.agents.find((item) => item.id === route.agentId);
+  if (!agent || getAgentViewMode(agent) !== 'byobu') {
+    return null;
+  }
+
+  return agent.id;
+}
+
+function getWarmDetailPath(detailPath) {
+  const separator = detailPath.includes('?') ? '&' : '?';
+  return `${detailPath}${separator}agent_watch_focus=0`;
+}
+
 function ensureNavLinks(config) {
   const orderKey = config.agents.map((agent) => agent.id).join('|');
   if (state.nav.orderKey === orderKey && state.nav.homeLink && state.nav.agentLinks.size === config.agents.length) {
@@ -366,12 +384,20 @@ function ensureDetailView(agent) {
   view.dataset.agentId = agent.id;
   const detailFrame = view.querySelector('.terminal-frame--detail');
   if (detailFrame instanceof HTMLIFrameElement) {
+    const warmDetailPath = getWarmDetailPath(agent.detailPath);
+    if (detailFrame.getAttribute('src') !== warmDetailPath) {
+      detailFrame.setAttribute('src', warmDetailPath);
+    }
     detailFrame.addEventListener('load', () => {
-      if (route.kind === 'agent' && route.agentId === agent.id) {
-        focusTerminalFrame(detailFrame);
+      syncDetailTerminalConnections(route.kind === 'agent'
+        ? state.config?.agents.find((item) => item.id === route.agentId) || null
+        : null);
+      if (route.kind === 'agent' && route.agentId === agent.id && getAgentViewMode(agent) === 'byobu') {
+        focusRouteTerminal();
       }
     });
   }
+  syncAgentDetailMode(agent, view, route.kind === 'agent' && route.agentId === agent.id ? null : 'byobu');
   app.append(view);
   state.views.detailById.set(agent.id, view);
   return view;
@@ -385,57 +411,44 @@ function showOnly(activeView) {
       view.classList.toggle('is-active', isActive);
       view.classList.toggle('is-inactive', !isActive);
       view.setAttribute('aria-hidden', String(!isActive));
+      view.inert = !isActive;
     }
   }
 }
 
-function renderPreviewCard(agent) {
-  const badge = agent.badge
-    ? `<span class="agent-badge">${escapeHtml(agent.badge)}</span>`
-    : '';
+function syncDetailTerminalConnections(activeAgent) {
+  const activeAgentId = activeAgent?.id || null;
+  const activeByobuAgentId = Boolean(activeAgentId) && getAgentViewMode(activeAgent) === 'byobu'
+    ? activeAgentId
+    : null;
 
+  for (const agent of state.config?.agents || []) {
+    const detailView = state.views.detailById.get(agent.id);
+    const frame = detailView?.querySelector('.terminal-frame--detail');
+    if (!(frame instanceof HTMLIFrameElement)) {
+      continue;
+    }
+
+    const warmDetailPath = getWarmDetailPath(agent.detailPath);
+    if (frame.getAttribute('src') !== warmDetailPath) {
+      frame.setAttribute('src', warmDetailPath);
+    }
+
+    const isActive = agent.id === activeByobuAgentId;
+    syncTerminalFrameInputState(frame, isActive);
+    frame.tabIndex = isActive ? 0 : -1;
+    if (!isActive) {
+      blurTerminalFrame(frame);
+    }
+  }
+}
+
+function renderHomePlaceholder() {
   return `
-    <article
-      class="agent-card is-status-syncing"
-      style="--agent-accent:${escapeAttr(agent.accent || '#d06d32')}"
-      data-agent-card="${escapeAttr(agent.id)}"
-    >
-      <div class="agent-card__header">
-        <div class="agent-card__summary">
-          <div class="agent-card__title-row">
-            <h3>${escapeHtml(agent.name)}</h3>
-            ${badge}
-            <span class="agent-status is-syncing" data-agent-status>Syncing</span>
-            <p class="agent-card__meta agent-card__meta--inline">${escapeHtml(agent.description || 'No description set')}</p>
-          </div>
-        </div>
-        <div class="agent-card__actions">
-          <span class="agent-source">${escapeHtml(agent.source)}</span>
-          <a class="agent-button" href="/agents/${agent.id}">Focus</a>
-        </div>
-      </div>
-      <div
-        class="agent-card__terminal-wrap"
-        data-home-terminal
-        data-agent-id="${escapeAttr(agent.id)}"
-        data-preview-path="${escapeAttr(agent.previewPath)}"
-        data-detail-path="${escapeAttr(agent.detailPath)}"
-      >
-        <pre
-          class="terminal-snapshot"
-          data-home-snapshot
-          data-snapshot-text
-          aria-label="Snapshot for ${escapeAttr(agent.name)}"
-        ></pre>
-        <iframe
-          class="terminal-frame terminal-frame--home"
-          title="Interactive terminal for ${escapeAttr(agent.name)}"
-          data-home-terminal-frame
-          referrerpolicy="no-referrer"
-          hidden
-        ></iframe>
-      </div>
-    </article>
+    <section class="empty-state">
+      <p class="eyebrow">Home</p>
+      <h2>No dashboard widgets yet.</h2>
+    </section>
   `;
 }
 
@@ -444,7 +457,7 @@ function renderAgentDetail(agent) {
 
   if (agent.claudeCurrentPath) {
     panels.push(`
-        <section class="detail-panel detail-panel--chat" data-detail-panel="claude" hidden>
+        <section class="detail-panel detail-panel--chat" data-detail-panel="claude">
           <section class="chat-page" data-chat-page data-agent-id="${escapeAttr(agent.id)}">
             <header class="chat-page__header">
               <div>
@@ -490,7 +503,7 @@ function renderAgentDetail(agent) {
 
   if (agent.historyPath) {
     panels.push(`
-        <section class="detail-panel detail-panel--history" data-detail-panel="history" hidden>
+        <section class="detail-panel detail-panel--history" data-detail-panel="history">
           <section class="history-page" data-history-page data-agent-id="${escapeAttr(agent.id)}">
             <header class="history-page__header">
               <div>
@@ -513,7 +526,7 @@ function renderAgentDetail(agent) {
   }
 
   panels.push(`
-        <section class="detail-panel detail-panel--terminal" data-detail-panel="byobu" hidden>
+        <section class="detail-panel detail-panel--terminal" data-detail-panel="byobu">
           <section class="detail-terminal">
             <iframe
               class="terminal-frame terminal-frame--detail"
@@ -532,18 +545,23 @@ function renderAgentDetail(agent) {
   `;
 }
 
-function syncAgentDetailMode(agent, view) {
+function syncAgentDetailMode(agent, view, modeOverride = null) {
   if (!(view instanceof HTMLElement)) {
     return;
   }
 
-  const mode = getAgentViewMode(agent);
-  const chatPanel = view.querySelector('[data-detail-panel="claude"]');
-  const historyPanel = view.querySelector('[data-detail-panel="history"]');
-  const byobuPanel = view.querySelector('[data-detail-panel="byobu"]');
-  chatPanel?.toggleAttribute('hidden', mode !== 'claude');
-  historyPanel?.toggleAttribute('hidden', mode !== 'history');
-  byobuPanel?.toggleAttribute('hidden', mode !== 'byobu');
+  const mode = modeOverride || getAgentViewMode(agent);
+  for (const panel of view.querySelectorAll('[data-detail-panel]')) {
+    if (!(panel instanceof HTMLElement)) {
+      continue;
+    }
+
+    const isActive = panel.dataset.detailPanel === mode;
+    panel.classList.toggle('is-active', isActive);
+    panel.classList.toggle('is-inactive', !isActive);
+    panel.setAttribute('aria-hidden', String(!isActive));
+    panel.inert = !isActive;
+  }
 }
 
 function renderChatFilterButton(agentId, value, label) {
@@ -622,17 +640,6 @@ function handleDocumentClick(event) {
     return;
   }
 
-  if (route.kind === 'home') {
-    const homeTerminal = event.target.closest('[data-home-terminal]');
-    if (homeTerminal instanceof HTMLElement && !event.target.closest('a, button')) {
-      const { agentId } = homeTerminal.dataset;
-      if (agentId) {
-        activateHomeTerminal(agentId);
-        return;
-      }
-    }
-  }
-
   const filterButton = event.target.closest('[data-chat-filter]');
   if (filterButton instanceof HTMLButtonElement) {
     const { agentId, chatFilter } = filterButton.dataset;
@@ -655,13 +662,7 @@ function handleDocumentClick(event) {
 
   const link = event.target.closest('a[href]');
   if (!link || !shouldHandleNavigation(event, link)) {
-    retainHomeTerminalFocus(event.target);
     return;
-  }
-
-  const card = link.closest('[data-agent-card]');
-  if (card?.dataset.agentCard) {
-    state.activeHomeAgentId = card.dataset.agentCard;
   }
 
   event.preventDefault();
@@ -784,7 +785,55 @@ function handleDocumentKeydown(event) {
   if (event.key === 'Escape' && state.configModalOpen) {
     event.preventDefault();
     closeConfigModal();
+    return;
   }
+
+  if (!event.altKey || event.metaKey || event.ctrlKey || event.shiftKey) {
+    return;
+  }
+
+  if (isEditableShortcutTarget(event.target)) {
+    return;
+  }
+
+  const shortcutTarget = getShortcutNavigationTarget(event);
+  if (!shortcutTarget) {
+    return;
+  }
+
+  event.preventDefault();
+  navigateTo(shortcutTarget);
+}
+
+function isEditableShortcutTarget(target) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  if (target.closest('[contenteditable="true"]')) {
+    return true;
+  }
+
+  return target.matches('input, textarea, select, [contenteditable="true"]');
+}
+
+function getShortcutNavigationTarget(event) {
+  const key = String(event.key || '');
+  if (!/^\d$/.test(key)) {
+    return null;
+  }
+
+  if (key === '0') {
+    return '/';
+  }
+
+  const agentIndex = Number.parseInt(key, 10) - 1;
+  const agent = state.config?.agents?.[agentIndex];
+  if (!agent) {
+    return null;
+  }
+
+  return `/agents/${encodeURIComponent(agent.id)}`;
 }
 
 async function loadConfigEditor() {
@@ -814,7 +863,6 @@ async function loadConfigEditor() {
 
 async function saveConfigEditor() {
   const raw = configEditor?.value || '';
-  const currentActiveHomeAgentId = state.activeHomeAgentId;
 
   setConfigStatus('Saving...');
   setConfigEditorBusy(true);
@@ -837,12 +885,7 @@ async function saveConfigEditor() {
     }
 
     state.config = applyStoredAgentOrder(payload.config);
-    const nextActiveHomeAgentId = state.config.agents.some((agent) => agent.id === currentActiveHomeAgentId)
-      ? currentActiveHomeAgentId
-      : null;
-
     initializeViews(state.config);
-    state.activeHomeAgentId = nextActiveHomeAgentId;
     renderCurrentRoute();
     refreshDashboardState().catch((error) => {
       console.error(error);
@@ -1028,22 +1071,6 @@ function syncAgentOrder() {
     : null;
 
   renderShell(state.config, routeAgent);
-  syncHomeCardOrder();
-  focusRouteTerminal();
-}
-
-function syncHomeCardOrder() {
-  const homeView = state.views.home;
-  if (!homeView) {
-    return;
-  }
-
-  for (const agent of state.config.agents) {
-    const card = homeView.querySelector(`[data-agent-card="${CSS.escape(agent.id)}"]`);
-    if (card) {
-      homeView.append(card);
-    }
-  }
 }
 
 function applyStoredAgentOrder(config) {
@@ -1127,124 +1154,6 @@ function saveStoredAgentOrder(agents) {
   } catch {}
 }
 
-function syncHomeTerminals(excludedAgentId = null) {
-  const homeView = state.views.home;
-  if (!homeView) {
-    return;
-  }
-
-  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    const frame = terminal.querySelector('[data-home-terminal-frame]');
-    const snapshot = terminal.querySelector('[data-home-snapshot]');
-    const previewPath = terminal.dataset.previewPath;
-    const detailPath = terminal.dataset.detailPath;
-    const { agentId } = terminal.dataset;
-    const card = terminal.closest('[data-agent-card]');
-    if (!(frame instanceof HTMLIFrameElement) || !detailPath || !card || !agentId) {
-      continue;
-    }
-
-    const shouldConnect = route.kind === 'home'
-      && agentId === state.activeHomeAgentId
-      && agentId !== excludedAgentId
-      && !hasConnectedDetailTerminal(agentId);
-
-    const desiredSrc = route.kind === 'home' && agentId !== excludedAgentId
-      ? (shouldConnect ? detailPath : (previewPath || detailPath))
-      : '';
-
-    if (desiredSrc) {
-      if (frame.getAttribute('src') !== desiredSrc) {
-        terminal.dataset.frameReady = 'false';
-        frame.src = desiredSrc;
-      }
-      frame.hidden = false;
-      if (terminal.dataset.frameReady === 'true') {
-        snapshot?.setAttribute('hidden', '');
-      } else {
-        snapshot?.removeAttribute('hidden');
-      }
-    } else {
-      terminal.dataset.frameReady = 'false';
-      if (frame.getAttribute('src')) {
-        frame.removeAttribute('src');
-      }
-      frame.hidden = true;
-      snapshot?.removeAttribute('hidden');
-    }
-
-    card.classList.toggle('is-live', shouldConnect);
-  }
-}
-
-function hasConnectedDetailTerminal(agentId) {
-  const detailView = state.views.detailById.get(agentId);
-  const detailFrame = detailView?.querySelector('.terminal-frame--detail');
-  return detailFrame instanceof HTMLIFrameElement && Boolean(detailFrame.getAttribute('src'));
-}
-
-function disconnectDetailTerminals() {
-  for (const view of state.views.detailById.values()) {
-    const frame = view.querySelector('.terminal-frame--detail');
-    if (!(frame instanceof HTMLIFrameElement)) {
-      continue;
-    }
-
-    if (frame.getAttribute('src')) {
-      frame.removeAttribute('src');
-    }
-  }
-}
-
-function connectDetailTerminal(agent) {
-  const view = ensureDetailView(agent);
-  const frame = view.querySelector('.terminal-frame--detail');
-  if (!(frame instanceof HTMLIFrameElement)) {
-    return;
-  }
-
-  if (frame.getAttribute('src') !== agent.detailPath) {
-    frame.src = agent.detailPath;
-  }
-}
-
-function activateHomeTerminal(agentId) {
-  if (!agentId) {
-    return;
-  }
-
-  state.activeHomeAgentId = agentId;
-  syncHomeTerminals(route.kind === 'agent' ? route.agentId : null);
-  focusRouteTerminal();
-}
-
-function bindHomeTerminals(homeView) {
-  for (const terminal of homeView.querySelectorAll('[data-home-terminal]')) {
-    const frame = terminal.querySelector('[data-home-terminal-frame]');
-    const snapshot = terminal.querySelector('[data-home-snapshot]');
-    const card = terminal.closest('[data-agent-card]');
-    if (!(frame instanceof HTMLIFrameElement) || !card) {
-      continue;
-    }
-
-    frame.addEventListener('focus', () => {
-      const { agentId } = terminal.dataset;
-      if (!agentId) {
-        return;
-      }
-
-      activateHomeTerminal(agentId);
-    });
-
-    frame.addEventListener('load', () => {
-      terminal.dataset.frameReady = 'true';
-      snapshot?.setAttribute('hidden', '');
-      if (route.kind === 'home' && terminal.dataset.agentId === state.activeHomeAgentId) {
-        focusTerminalFrame(frame);
-      }
-    });
-  }
-}
 
 function startDashboardStatePolling() {
   stopDashboardStatePolling();
@@ -1552,17 +1461,7 @@ function getMonitorConfig() {
 }
 
 function setAgentSnapshotText(agentId, snapshot) {
-  const element = state.views.home?.querySelector(
-    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-snapshot-text]`
-  );
-  if (!(element instanceof HTMLElement)) {
-    return;
-  }
-
-  element.textContent = snapshot || '';
-  requestAnimationFrame(() => {
-    element.scrollTop = element.scrollHeight;
-  });
+  return;
 }
 
 function refreshLiveActivityState() {
@@ -1619,13 +1518,6 @@ function getLiveAgentSource(agentId) {
     return { frame: detailFrame, sourceKey: `detail:${agentId}` };
   }
 
-  const homeFrame = state.views.home?.querySelector(
-    `[data-home-terminal][data-agent-id="${CSS.escape(agentId)}"] [data-home-terminal-frame]`
-  );
-  if (homeFrame instanceof HTMLIFrameElement && homeFrame.getAttribute('src')) {
-    return { frame: homeFrame, sourceKey: `home:${agentId}` };
-  }
-
   return null;
 }
 
@@ -1674,35 +1566,10 @@ function syncDisplayedAgentStatus(agentId) {
 }
 
 function setAgentActivityStatus(agentId, status) {
-  const card = agentId
-    ? state.views.home?.querySelector(`[data-agent-card="${CSS.escape(agentId)}"]`)
-    : null;
-  const label = card?.querySelector('[data-agent-status]');
-  const nextText = {
-    active: 'Active',
-    waiting: 'Waiting',
-    syncing: 'Syncing'
-  }[status] || 'Syncing';
-
   if (agentId) {
     state.activity.statusByAgent.set(agentId, status);
     setNavAgentActivityStatus(agentId, status);
   }
-
-  if (card instanceof HTMLElement) {
-    card.classList.toggle('is-status-active', status === 'active');
-    card.classList.toggle('is-status-waiting', status === 'waiting');
-    card.classList.toggle('is-status-syncing', status === 'syncing');
-  }
-
-  if (!(label instanceof HTMLElement)) {
-    return;
-  }
-
-  label.textContent = nextText;
-  label.classList.toggle('is-active', status === 'active');
-  label.classList.toggle('is-waiting', status === 'waiting');
-  label.classList.toggle('is-syncing', status === 'syncing');
 }
 
 function syncNavActivityStatuses() {
@@ -2022,6 +1889,7 @@ function prepareRouteView(view, type) {
   view.classList.add('route-view', `route-view--${type}`);
   view.classList.add('is-inactive');
   view.setAttribute('aria-hidden', 'true');
+  view.inert = true;
 }
 
 function htmlToElement(markup) {
@@ -2031,45 +1899,18 @@ function htmlToElement(markup) {
 }
 
 function focusRouteTerminal() {
-  if (route.kind === 'agent') {
-    const agent = state.config?.agents.find((item) => item.id === route.agentId);
-    if (getAgentViewMode(agent) !== 'byobu') {
-      return;
-    }
-    const activeView = state.views.detailById.get(route.agentId);
-    const frame = activeView?.querySelector('.terminal-frame--detail');
-    focusTerminalFrame(frame);
+  if (route.kind !== 'agent') {
     return;
   }
 
-  const selector = state.activeHomeAgentId
-    ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
-    : null;
-  const frame = selector ? state.views.home?.querySelector(selector) : null;
-  if (frame instanceof HTMLIFrameElement && !frame.getAttribute('src')) {
+  const agent = state.config?.agents.find((item) => item.id === route.agentId);
+  if (!agent || getAgentViewMode(agent) !== 'byobu') {
     return;
   }
+
+  const activeView = state.views.detailById.get(route.agentId);
+  const frame = activeView?.querySelector('.terminal-frame--detail');
   focusTerminalFrame(frame);
-}
-
-function retainHomeTerminalFocus(target) {
-  if (state.configModalOpen || route.kind !== 'home' || !(target instanceof Element)) {
-    return;
-  }
-
-  if (target.closest('[data-home-terminal]')) {
-    return;
-  }
-
-  const selector = state.activeHomeAgentId
-    ? `[data-home-terminal][data-agent-id="${CSS.escape(state.activeHomeAgentId)}"] [data-home-terminal-frame]`
-    : null;
-  const frame = selector ? state.views.home?.querySelector(selector) : null;
-  if (!(frame instanceof HTMLIFrameElement) || !frame.getAttribute('src')) {
-    return;
-  }
-
-  requestAnimationFrame(() => focusTerminalFrame(frame));
 }
 
 function focusTerminalFrame(frame) {
@@ -2077,34 +1918,109 @@ function focusTerminalFrame(frame) {
     return;
   }
 
+  const focusToken = (state.routeTerminalFocusToken || 0) + 1;
+  state.routeTerminalFocusToken = focusToken;
+
+  let attempts = 0;
+
   const tryFocus = () => {
-    if (!frame.isConnected) {
+    if (state.routeTerminalFocusToken !== focusToken || !frame.isConnected || frame.inert) {
       return;
     }
 
+    let focused = false;
+
     try {
-      frame.focus();
-      frame.contentWindow?.focus();
+      frame.focus({ preventScroll: true });
+      frame.contentWindow?.focus?.();
+      frame.contentWindow?.__agentWatchSetFocusEnabled?.(true);
 
       const term = frame.contentWindow?.term;
       if (term && typeof term.focus === 'function') {
         term.focus();
+        if (typeof term.scrollToBottom === 'function') {
+          term.scrollToBottom();
+        }
+        focused = true;
       }
 
       const doc = frame.contentDocument;
+      const viewport = doc?.querySelector('.xterm-viewport');
+      if (viewport instanceof HTMLElement) {
+        viewport.scrollTop = viewport.scrollHeight;
+      }
+
       const helper = doc?.querySelector('.xterm-helper-textarea');
       if (helper instanceof HTMLElement) {
         helper.focus({ preventScroll: true });
+        focused = true;
       } else {
         const xterm = doc?.querySelector('.xterm');
         if (xterm instanceof HTMLElement) {
           xterm.focus({ preventScroll: true });
+          focused = true;
         }
       }
     } catch {}
+
+    attempts += 1;
+    if (attempts < 12) {
+      setTimeout(tryFocus, focused ? 40 : 120);
+    }
   };
 
   requestAnimationFrame(tryFocus);
+}
+
+function blurTerminalFrame(frame) {
+  if (!(frame instanceof HTMLIFrameElement)) {
+    return;
+  }
+
+  try {
+    const doc = frame.contentDocument;
+    const helper = doc?.querySelector('.xterm-helper-textarea');
+    if (helper instanceof HTMLElement) {
+      helper.blur();
+    }
+    if (doc?.activeElement instanceof HTMLElement) {
+      doc.activeElement.blur();
+    }
+    frame.contentWindow?.blur?.();
+    frame.blur();
+  } catch {}
+}
+
+function syncTerminalFrameInputState(frame, isActive) {
+  if (!(frame instanceof HTMLIFrameElement)) {
+    return;
+  }
+
+  const desiredValue = String(!isActive);
+  if (frame.dataset.stdinDisabled === desiredValue) {
+    return;
+  }
+
+  try {
+    frame.contentWindow?.__agentWatchSetFocusEnabled?.(isActive);
+    const term = frame.contentWindow?.term;
+    const doc = frame.contentDocument;
+    const helper = doc?.querySelector('.xterm-helper-textarea');
+    if (helper instanceof HTMLElement) {
+      helper.tabIndex = isActive ? 0 : -1;
+    }
+    const xterm = doc?.querySelector('.xterm');
+    if (xterm instanceof HTMLElement) {
+      xterm.tabIndex = isActive ? 0 : -1;
+    }
+    if (term && typeof term.setOption === 'function') {
+      term.setOption('disableStdin', !isActive);
+      frame.dataset.stdinDisabled = desiredValue;
+      return;
+    }
+  } catch {}
+
+  delete frame.dataset.stdinDisabled;
 }
 
 function getRoute(pathname, search = '') {

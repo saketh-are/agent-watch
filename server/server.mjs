@@ -30,8 +30,8 @@ let agentMonitorTimer = null;
 let agentMonitorRunning = false;
 const terminalRootCache = new Map();
 const agentMonitorState = new Map();
-const terminalUnloadPatch = [
-  '<script data-agent-watch="disable-unload-warning">',
+const terminalBootstrapPatch = [
+  '<script data-agent-watch="terminal-bootstrap">',
   '(() => {',
   '  try {',
   '    const originalAdd = window.addEventListener.bind(window);',
@@ -54,6 +54,43 @@ const terminalUnloadPatch = [
   '      set() {}',
   '    });',
   '    window.onbeforeunload = null;',
+  '  } catch {}',
+  '  try {',
+  '    const params = new URLSearchParams(window.location.search);',
+  '    let focusEnabled = params.get("agent_watch_focus") !== "0";',
+  '    let currentTerm = null;',
+  '    const blurTerminal = () => {',
+  '      try {',
+  '        const helper = document.querySelector(".xterm-helper-textarea");',
+  '        if (helper instanceof HTMLElement) helper.blur();',
+  '        if (document.activeElement instanceof HTMLElement) document.activeElement.blur();',
+  '        window.blur?.();',
+  '      } catch {}',
+  '    };',
+  '    const syncTermFocus = (term) => {',
+  '      if (!term || typeof term !== "object") return;',
+  '      if (!term.__agentWatchOriginalFocus && typeof term.focus === "function") {',
+  '        term.__agentWatchOriginalFocus = term.focus.bind(term);',
+  '      }',
+  '      if (typeof term.__agentWatchOriginalFocus === "function") {',
+  '        term.focus = (...args) => {',
+  '          if (!focusEnabled) return;',
+  '          return term.__agentWatchOriginalFocus(...args);',
+  '        };',
+  '      }',
+  '    };',
+  '    Object.defineProperty(window, "term", {',
+  '      configurable: true,',
+  '      get() { return currentTerm; },',
+  '      set(value) { currentTerm = value; syncTermFocus(currentTerm); }',
+  '    });',
+  '    window.__agentWatchSetFocusEnabled = (enabled) => {',
+  '      focusEnabled = !!enabled;',
+  '      syncTermFocus(currentTerm);',
+  '      if (!focusEnabled) blurTerminal();',
+  '      return focusEnabled;',
+  '    };',
+  '    window.__agentWatchIsFocusEnabled = () => focusEnabled;',
   '  } catch {}',
   '})();',
   '</script>'
@@ -792,19 +829,31 @@ function sanitizeProxyHeaders(headers) {
 }
 
 function getTerminalRootCacheKey(targetUrl) {
-  return `${targetUrl.origin}${targetUrl.pathname}`;
+  return `${targetUrl.origin}${targetUrl.pathname}${targetUrl.search}`;
 }
 
 function patchTerminalHtml(html) {
-  if (html.includes('data-agent-watch="disable-unload-warning"')) {
-    return html;
+  let patched = html;
+
+  patched = patched.replace(
+    'onSocketError(e){console.error("[ttyd] websocket connection error: ",e),this.doReconnect=!1}',
+    'onSocketError(e){console.error("[ttyd] websocket connection error: ",e)}'
+  );
+
+  patched = patched.replace(
+    'else{const{terminal:e}=this,i=e.onKey(e=>{"Enter"===e.domEvent.key&&(i.dispose(),n.showOverlay("Reconnecting...",null),t().then(r))});n.showOverlay("Press ⏎ to Reconnect",null)}}',
+    'else n.showOverlay("Reconnecting...",null),window.setTimeout(()=>{t().then(r)},250)}'
+  );
+
+  if (patched.includes('data-agent-watch="terminal-bootstrap"')) {
+    return patched;
   }
 
-  if (html.includes('</head>')) {
-    return html.replace('</head>', `${terminalUnloadPatch}</head>`);
+  if (patched.includes('</head>')) {
+    return patched.replace('</head>', `${terminalBootstrapPatch}</head>`);
   }
 
-  return `${terminalUnloadPatch}${html}`;
+  return `${terminalBootstrapPatch}${patched}`;
 }
 
 function startConfigWatcher() {
