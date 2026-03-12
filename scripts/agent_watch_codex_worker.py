@@ -39,13 +39,13 @@ def write_json_file(path, payload):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Serve normalized Claude Code transcript state for Agent Watch."
+        description="Serve normalized Codex session state for Agent Watch."
     )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=7811)
+    parser.add_argument("--port", type=int, default=7812)
     parser.add_argument("--host-id", default=socket.gethostname())
-    parser.add_argument("--tool", default="claude")
-    parser.add_argument("--source-root", default=os.path.expanduser("~/.claude/projects"))
+    parser.add_argument("--tool", default="codex")
+    parser.add_argument("--source-root", default=os.path.expanduser("~/.codex/sessions"))
     parser.add_argument(
         "--state-root",
         default=os.path.join(
@@ -60,7 +60,7 @@ def parse_args():
     return parser.parse_args()
 
 
-class ClaudeWorkerStore:
+class CodexWorkerStore:
     def __init__(self, args):
         self.host_id = args.host_id
         self.tool = args.tool
@@ -123,8 +123,6 @@ class ClaudeWorkerStore:
             return []
         files = []
         for path in self.source_root.rglob("*.jsonl"):
-            if "subagents" in path.parts:
-                continue
             try:
                 stat = path.stat()
             except OSError:
@@ -162,11 +160,13 @@ class ClaudeWorkerStore:
             "path": path_key,
             "cwd": None,
             "gitBranch": None,
+            "cliVersion": None,
             "startedAt": None,
             "updatedAt": None,
             "lastRawTimestamp": None,
             "status": "running",
             "activeTurnId": None,
+            "pendingTurnId": None,
             "turnCounter": 0,
             "turns": [],
             "error": None,
@@ -229,147 +229,137 @@ class ClaudeWorkerStore:
     def _apply_payload(self, session, payload):
         session["updatedAt"] = payload.get("timestamp") or session.get("updatedAt") or utc_now()
         session["lastRawTimestamp"] = payload.get("timestamp") or session.get("lastRawTimestamp")
-        if payload.get("cwd"):
-            session["cwd"] = payload.get("cwd")
-        if payload.get("gitBranch"):
-            session["gitBranch"] = payload.get("gitBranch")
-        if payload.get("sessionId"):
-            session["sessionId"] = payload["sessionId"]
         if not session.get("startedAt") and payload.get("timestamp"):
             session["startedAt"] = payload["timestamp"]
 
-        normalized = self._normalize_payload(payload)
+        normalized = self._normalize_payload(session, payload)
         if normalized is None:
             return
         self._apply_event_to_session(session, normalized)
         self._append_event(normalized["kind"], session["sessionId"], normalized["data"], normalized.get("turnId"))
 
-    def _normalize_payload(self, payload):
+    def _normalize_payload(self, session, payload):
         entry_type = payload.get("type")
-        if entry_type == "assistant":
-            return self._normalize_assistant_payload(payload)
-        if entry_type == "user":
-            return self._normalize_user_payload(payload)
-        if entry_type == "queue-operation":
+
+        if entry_type == "session_meta":
+            data = payload.get("payload") or {}
+            session["sessionId"] = data.get("id") or session["sessionId"]
+            session["cwd"] = data.get("cwd") or session.get("cwd")
+            session["cliVersion"] = data.get("cli_version") or session.get("cliVersion")
+            git = data.get("git") or {}
+            if isinstance(git, dict):
+                session["gitBranch"] = git.get("branch") or session.get("gitBranch")
+            started_at = data.get("timestamp")
+            if started_at and not session.get("startedAt"):
+                session["startedAt"] = started_at
+            return None
+
+        if entry_type == "turn_context":
+            data = payload.get("payload") or {}
+            session["cwd"] = data.get("cwd") or session.get("cwd")
+            return None
+
+        if entry_type == "event_msg":
+            return self._normalize_event_msg(payload.get("payload") or {}, payload.get("timestamp"))
+
+        if entry_type == "response_item":
+            return self._normalize_response_item(payload.get("payload") or {}, payload.get("timestamp"))
+
+        if entry_type == "compacted":
+            return None
+
+        return None
+
+    def _normalize_event_msg(self, payload, timestamp):
+        event_type = payload.get("type")
+        if event_type == "task_started":
             return {
-                "kind": "background_task",
+                "kind": "turn_started",
                 "data": {
-                    "operation": payload.get("operation"),
-                    "content": payload.get("content"),
-                    "timestamp": payload.get("timestamp"),
+                    "turnId": payload.get("turn_id"),
+                    "timestamp": timestamp,
                 },
             }
-        if entry_type == "last-prompt":
+        if event_type == "user_message":
             return {
-                "kind": "last_prompt",
-                "data": {"text": payload.get("lastPrompt", "")},
+                "kind": "user_prompt",
+                "data": {
+                    "text": payload.get("message", ""),
+                    "timestamp": timestamp,
+                },
+            }
+        if event_type == "agent_message":
+            return {
+                "kind": "assistant_message",
+                "data": {
+                    "text": payload.get("message", ""),
+                    "phase": payload.get("phase"),
+                    "timestamp": timestamp,
+                },
+            }
+        if event_type == "task_complete":
+            return {
+                "kind": "turn_finished",
+                "data": {
+                    "turnId": payload.get("turn_id"),
+                    "assistantText": payload.get("last_agent_message", ""),
+                    "timestamp": timestamp,
+                },
             }
         return None
 
-    def _normalize_user_payload(self, payload):
-        message = payload.get("message", {})
-        content = message.get("content")
-
-        if payload.get("isMeta"):
-            return None
-
-        if isinstance(content, list):
-            tool_results = []
-            tool_use_result = payload.get("toolUseResult")
-            tool_use_result_payload = tool_use_result if isinstance(tool_use_result, dict) else {}
-            for item in content:
-                if item.get("type") != "tool_result":
-                    continue
-                tool_results.append(
-                    {
-                        "toolUseId": item.get("tool_use_id"),
-                        "text": item.get("content", ""),
-                        "isError": bool(item.get("is_error")),
-                        "stdout": tool_use_result_payload.get("stdout"),
-                        "stderr": tool_use_result_payload.get("stderr"),
-                        "interrupted": bool(tool_use_result_payload.get("interrupted")),
-                    }
-                )
-            if tool_results:
-                return {
-                    "kind": "tool_result",
-                    "data": {
-                        "results": tool_results,
-                        "timestamp": payload.get("timestamp"),
-                    },
-                }
-            return None
-
-        if not isinstance(content, str):
-            return None
-
-        if content.startswith("<command-name>") or "<local-command-stdout>" in content:
+    def _normalize_response_item(self, payload, timestamp):
+        item_type = payload.get("type")
+        if item_type in {"function_call", "custom_tool_call", "web_search_call"}:
             return {
-                "kind": "local_command",
+                "kind": "tool_use",
                 "data": {
-                    "content": content,
-                    "timestamp": payload.get("timestamp"),
+                    "callId": payload.get("call_id"),
+                    "name": payload.get("name") or item_type,
+                    "input": self._parse_tool_input(payload),
+                    "status": payload.get("status"),
+                    "timestamp": timestamp,
                 },
             }
 
-        if content.startswith("<local-command-caveat>"):
-            return None
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
+            return {
+                "kind": "tool_result",
+                "data": {
+                    "callId": payload.get("call_id"),
+                    "text": payload.get("output", ""),
+                    "timestamp": timestamp,
+                },
+            }
 
-        return {
-            "kind": "user_prompt",
-            "data": {
-                "text": content,
-                "cwd": payload.get("cwd"),
-                "gitBranch": payload.get("gitBranch"),
-                "permissionMode": payload.get("permissionMode"),
-                "timestamp": payload.get("timestamp"),
-            },
-        }
+        return None
 
-    def _normalize_assistant_payload(self, payload):
-        message = payload.get("message", {})
-        content = message.get("content", [])
-        text_parts = []
-        thinking_parts = []
-        tool_uses = []
-
-        if isinstance(content, list):
-            for item in content:
-                item_type = item.get("type")
-                if item_type == "text":
-                    text_parts.append(item.get("text", ""))
-                elif item_type == "thinking":
-                    thinking_parts.append(item.get("thinking", ""))
-                elif item_type == "tool_use":
-                    tool_uses.append(
-                        {
-                            "id": item.get("id"),
-                            "name": item.get("name"),
-                            "input": item.get("input", {}),
-                        }
-                    )
-
-        return {
-            "kind": "assistant_message",
-            "data": {
-                "text": "\n".join(part for part in text_parts if part).strip(),
-                "thinking": "\n".join(part for part in thinking_parts if part).strip(),
-                "toolUses": tool_uses,
-                "stopReason": message.get("stop_reason"),
-                "requestId": payload.get("requestId"),
-                "error": payload.get("error"),
-                "isApiErrorMessage": bool(payload.get("isApiErrorMessage")),
-                "timestamp": payload.get("timestamp"),
-            },
-        }
+    def _parse_tool_input(self, payload):
+        if "input" in payload:
+            return payload.get("input")
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, str):
+            return {}
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError:
+            return {"arguments": arguments}
 
     def _apply_event_to_session(self, session, event):
         kind = event["kind"]
         data = event["data"]
 
+        if kind == "turn_started":
+            pending_turn_id = data.get("turnId")
+            if pending_turn_id:
+                session["pendingTurnId"] = pending_turn_id
+            session["status"] = "running"
+            session["error"] = None
+            return
+
         if kind == "user_prompt":
             session["turnCounter"] += 1
-            turn_id = f"turn-{session['turnCounter']}"
+            turn_id = session.get("pendingTurnId") or f"turn-{session['turnCounter']}"
             turn = {
                 "turnId": turn_id,
                 "userText": data.get("text", ""),
@@ -385,6 +375,7 @@ class ClaudeWorkerStore:
             session["turns"].append(turn)
             session["turns"] = session["turns"][-self.max_turns :]
             session["activeTurnId"] = turn_id
+            session["pendingTurnId"] = None
             session["status"] = "running"
             session["error"] = None
             event["turnId"] = turn_id
@@ -395,27 +386,26 @@ class ClaudeWorkerStore:
         if kind == "assistant_message":
             if active_turn is None:
                 return
-            text = data.get("text") or ""
+            text = (data.get("text") or "").strip()
             if text:
-                active_turn["assistantText"] = "\n".join(
-                    part for part in [active_turn.get("assistantText", "").strip(), text.strip()] if part
+                active_turn["assistantText"] = "\n\n".join(
+                    part for part in [active_turn.get("assistantText", "").strip(), text] if part
                 ).strip()
-            thinking = data.get("thinking") or ""
-            if thinking:
-                active_turn["thinking"] = "\n".join(
-                    part for part in [active_turn.get("thinking", "").strip(), thinking.strip()] if part
-                ).strip()
-            if data.get("toolUses"):
-                active_turn["toolUses"].extend(data["toolUses"])
-            if data.get("error"):
-                active_turn["error"] = data["error"]
-                active_turn["status"] = "error"
-                session["error"] = data["error"]
-                session["status"] = "error"
-            else:
-                stop_reason = data.get("stopReason")
-                active_turn["status"] = "completed" if stop_reason == "end_turn" else "running"
-                session["status"] = "waiting" if stop_reason == "end_turn" else "running"
+            active_turn["updatedAt"] = data.get("timestamp")
+            event["turnId"] = active_turn["turnId"]
+            return
+
+        if kind == "tool_use":
+            if active_turn is None:
+                return
+            active_turn["toolUses"].append(
+                {
+                    "id": data.get("callId"),
+                    "name": data.get("name"),
+                    "input": data.get("input"),
+                    "status": data.get("status"),
+                }
+            )
             active_turn["updatedAt"] = data.get("timestamp")
             event["turnId"] = active_turn["turnId"]
             return
@@ -423,22 +413,50 @@ class ClaudeWorkerStore:
         if kind == "tool_result":
             if active_turn is None:
                 return
-            active_turn["toolResults"].extend(data.get("results", []))
+            active_turn["toolResults"].append(
+                {
+                    "toolUseId": data.get("callId"),
+                    "text": data.get("text", ""),
+                    "stdout": data.get("text", ""),
+                    "isError": False,
+                }
+            )
             active_turn["updatedAt"] = data.get("timestamp")
             event["turnId"] = active_turn["turnId"]
             return
 
-        if kind == "local_command":
+        if kind == "turn_finished":
+            turn = None
+            target_turn_id = data.get("turnId")
+            if target_turn_id:
+                turn = self._find_turn(session, target_turn_id)
+            if turn is None:
+                turn = active_turn
+            if turn is None:
+                return
+            final_text = (data.get("assistantText") or "").strip()
+            if final_text:
+                existing = (turn.get("assistantText") or "").strip()
+                if existing != final_text:
+                    turn["assistantText"] = "\n\n".join(part for part in [existing, final_text] if part).strip()
+            turn["status"] = "completed"
+            turn["updatedAt"] = data.get("timestamp")
+            session["status"] = "waiting"
+            session["activeTurnId"] = None
+            session["pendingTurnId"] = None
+            event["turnId"] = turn["turnId"]
             return
 
-    def _get_active_turn(self, session):
-        active_turn_id = session.get("activeTurnId")
-        if not active_turn_id:
+    def _find_turn(self, session, turn_id):
+        if not turn_id:
             return None
         for turn in reversed(session.get("turns", [])):
-            if turn["turnId"] == active_turn_id:
+            if turn["turnId"] == turn_id:
                 return turn
         return None
+
+    def _get_active_turn(self, session):
+        return self._find_turn(session, session.get("activeTurnId"))
 
     def _append_event(self, kind, session_id, data, turn_id=None):
         seq = self.state.get("nextEventSeq", 1)
@@ -532,7 +550,7 @@ class ClaudeWorkerStore:
         }
 
     def submit_prompt(self, text):
-        message = str(text or '').rstrip()
+        message = str(text or "").rstrip()
         if not message:
             raise ValueError("Prompt text is required")
         if not self.tmux_target:
@@ -565,7 +583,7 @@ class ClaudeWorkerStore:
         }
 
 
-class ClaudeWorkerHandler(BaseHTTPRequestHandler):
+class CodexWorkerHandler(BaseHTTPRequestHandler):
     store = None
 
     def do_GET(self):
@@ -580,11 +598,11 @@ class ClaudeWorkerHandler(BaseHTTPRequestHandler):
             self.respond_json(200, self.store.build_state())
             return
 
-        if parsed.path == "/tools/claude/current":
+        if parsed.path == "/tools/codex/current":
             self.respond_json(200, self.store.build_current())
             return
 
-        if parsed.path == "/tools/claude/events":
+        if parsed.path == "/tools/codex/events":
             since = safe_int(params.get("since", ["0"])[0], 0)
             self.respond_json(
                 200,
@@ -610,7 +628,7 @@ class ClaudeWorkerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/tools/claude/prompt":
+        if parsed.path != "/tools/codex/prompt":
             self.respond_json(404, {"error": "Not found"})
             return
 
@@ -646,8 +664,8 @@ class ClaudeWorkerHandler(BaseHTTPRequestHandler):
 
 def main():
     args = parse_args()
-    store = ClaudeWorkerStore(args)
-    handler = type("ConfiguredClaudeWorkerHandler", (ClaudeWorkerHandler,), {"store": store})
+    store = CodexWorkerStore(args)
+    handler = type("ConfiguredCodexWorkerHandler", (CodexWorkerHandler,), {"store": store})
     server = ThreadingHTTPServer((args.host, args.port), handler)
     server.serve_forever()
 

@@ -175,6 +175,36 @@ Endpoints:
 
 State is stored under `~/.local/state/agent-watch/worker/<host-id>/claude/`.
 
+## Codex worker
+
+There is also a worker-side Codex transcript service at `scripts/agent_watch_codex_worker.py`.
+
+It reads Codex session JSONL files from `~/.codex/sessions`, persists:
+
+- a raw per-file cursor
+- normalized session state
+- a derived event feed
+
+and serves them over HTTP for the dashboard or other tooling.
+
+Example:
+
+```bash
+python3 scripts/agent_watch_codex_worker.py \
+  --host-id ns1032968 \
+  --port 7811
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /state`
+- `GET /tools`
+- `GET /tools/codex/current`
+- `GET /tools/codex/events?since=0`
+
+State is stored under `~/.local/state/agent-watch/worker/<host-id>/codex/`.
+
 ## Custom TLS
 
 To use a trusted cert instead of the generated local cert:

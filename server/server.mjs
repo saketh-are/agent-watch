@@ -272,6 +272,52 @@ app.get('/api/agents/:id/claude/current', async (req, res) => {
   }
 });
 
+app.get('/api/agents/:id/codex/current', async (req, res) => {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+    return;
+  }
+
+  const agent = config.agents.find((item) => item.id === req.params.id);
+  if (!agent) {
+    res.status(404).json({ error: `Unknown agent "${req.params.id}"` });
+    return;
+  }
+
+  if (!agent.codexWorkerTarget) {
+    res.status(404).json({ error: `Codex worker is not configured for "${req.params.id}"` });
+    return;
+  }
+
+  try {
+    const targetUrl = new URL(agent.codexWorkerTarget);
+    targetUrl.pathname = joinTargetPath(targetUrl.pathname, '/tools/codex/current');
+    const response = await fetch(targetUrl, {
+      headers: {
+        accept: 'application/json',
+        ...(agent.headers || {})
+      }
+    });
+    const payload = await response.text();
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json; charset=utf-8')
+      .setHeader('cache-control', 'no-store')
+      .send(payload);
+  } catch (error) {
+    res.status(502).json({
+      error: 'Could not load Codex worker state',
+      detail: error.message
+    });
+  }
+});
+
 app.post('/api/agents/:id/claude/prompt', async (req, res) => {
   let config;
   try {
@@ -318,6 +364,57 @@ app.post('/api/agents/:id/claude/prompt', async (req, res) => {
   } catch (error) {
     res.status(502).json({
       error: 'Could not submit Claude prompt',
+      detail: error.message
+    });
+  }
+});
+
+app.post('/api/agents/:id/codex/prompt', async (req, res) => {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+    return;
+  }
+
+  const agent = config.agents.find((item) => item.id === req.params.id);
+  if (!agent) {
+    res.status(404).json({ error: `Unknown agent "${req.params.id}"` });
+    return;
+  }
+
+  if (!agent.codexWorkerTarget) {
+    res.status(404).json({ error: `Codex worker is not configured for "${req.params.id}"` });
+    return;
+  }
+
+  try {
+    const targetUrl = new URL(agent.codexWorkerTarget);
+    targetUrl.pathname = joinTargetPath(targetUrl.pathname, '/tools/codex/prompt');
+    const response = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        ...(agent.headers || {})
+      },
+      body: JSON.stringify({
+        text: String(req.body?.text || '')
+      })
+    });
+    const payload = await response.text();
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json; charset=utf-8')
+      .setHeader('cache-control', 'no-store')
+      .send(payload);
+  } catch (error) {
+    res.status(502).json({
+      error: 'Could not submit Codex prompt',
       detail: error.message
     });
   }
@@ -555,8 +652,14 @@ function buildPublicConfig(config) {
         claudeCurrentPath: agent.claudeWorkerTarget
           ? `/api/agents/${encodeURIComponent(agent.id)}/claude/current`
           : null,
-        claudePromptPath: agent.claudeWorkerTarget
+        claudePromptPath: agent.claudeWorkerTarget && agent.claudePromptEnabled !== false
           ? `/api/agents/${encodeURIComponent(agent.id)}/claude/prompt`
+          : null,
+        codexCurrentPath: agent.codexWorkerTarget
+          ? `/api/agents/${encodeURIComponent(agent.id)}/codex/current`
+          : null,
+        codexPromptPath: agent.codexWorkerTarget && agent.codexPromptEnabled !== false
+          ? `/api/agents/${encodeURIComponent(agent.id)}/codex/prompt`
           : null
       };
     })
@@ -601,6 +704,9 @@ function validateAgents(agents) {
     }
     if (agent.claudeWorkerTarget) {
       new URL(agent.claudeWorkerTarget);
+    }
+    if (agent.codexWorkerTarget) {
+      new URL(agent.codexWorkerTarget);
     }
   }
 }

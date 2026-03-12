@@ -19,6 +19,9 @@
       "accent": "#d06d32",
       "sourceLabel": "10.0.0.11:7681",
       "snapshotTarget": "http://127.0.0.1:7810/snapshot",
+      "claudeWorkerTarget": "http://127.0.0.1:7811/",
+      "codexWorkerTarget": "http://127.0.0.1:7812/",
+      "codexPromptEnabled": false,
       "target": "http://127.0.0.1:7681/",
       "previewTarget": "http://127.0.0.1:7681/"
     },

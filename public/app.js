@@ -48,6 +48,16 @@ const state = {
     summaryOpenByAgent: new Map(),
     didInitialScrollByAgent: new Map()
   },
+  codex: {
+    pollTimeoutId: null,
+    requestInFlight: false,
+    activeAgentId: null,
+    byAgent: new Map(),
+    filterByAgent: new Map(),
+    sendingByAgent: new Set(),
+    summaryOpenByAgent: new Map(),
+    didInitialScrollByAgent: new Map()
+  },
   history: {
     pollTimeoutId: null,
     requestInFlight: false,
@@ -144,6 +154,7 @@ async function boot() {
 function initializeViews(config) {
   app.textContent = '';
   state.chat.didInitialScrollByAgent.clear();
+  state.codex.didInitialScrollByAgent.clear();
   state.history.didInitialScrollByAgent.clear();
   state.views.empty = null;
   state.views.home = null;
@@ -197,13 +208,20 @@ function renderCurrentRoute() {
     syncDetailTerminalConnections(routeAgent);
     const mode = getAgentViewMode(routeAgent);
     if (mode === 'claude') {
+      stopCodexChatPolling();
       stopHistoryPolling();
       startClaudeChatPolling(routeAgent);
+    } else if (mode === 'codex') {
+      stopClaudeChatPolling();
+      stopHistoryPolling();
+      startCodexChatPolling(routeAgent);
     } else if (mode === 'history') {
       stopClaudeChatPolling();
+      stopCodexChatPolling();
       startHistoryPolling(routeAgent);
     } else {
       stopClaudeChatPolling();
+      stopCodexChatPolling();
       stopHistoryPolling();
     }
     showOnly(detailView);
@@ -214,6 +232,7 @@ function renderCurrentRoute() {
   }
 
   stopClaudeChatPolling();
+  stopCodexChatPolling();
   stopHistoryPolling();
   syncDetailTerminalConnections(null);
   showOnly(state.views.home);
@@ -257,17 +276,24 @@ function renderModeSwitcher(routeAgent) {
   }
 
   const supportsClaude = Boolean(routeAgent.claudeCurrentPath);
+  const supportsCodex = Boolean(routeAgent.codexCurrentPath);
   const supportsHistory = Boolean(routeAgent.historyPath);
   const mode = getAgentViewMode(routeAgent);
   const byobuHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=byobu`;
   const claudeHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=claude`;
+  const codexHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=codex`;
   const historyHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=history`;
 
   modeSwitcher.hidden = false;
   const links = [];
+  if (supportsCodex) {
+    links.push(`
+      <a class="mode-switcher__link ${mode === 'codex' ? 'is-active' : ''}" href="${escapeAttr(codexHref)}" title="Codex" aria-label="Codex">🤖</a>
+    `);
+  }
   if (supportsClaude) {
     links.push(`
-      <a class="mode-switcher__link ${mode === 'claude' ? 'is-active' : ''}" href="${escapeAttr(claudeHref)}" title="Claude" aria-label="Claude">💬</a>
+      <a class="mode-switcher__link ${mode === 'claude' ? 'is-active' : ''}" href="${escapeAttr(claudeHref)}" title="Claude" aria-label="Claude">✴️</a>
     `);
   }
   if (supportsHistory) {
@@ -286,11 +312,19 @@ function getAgentViewMode(agent) {
     return 'history';
   }
 
-  if (!agent?.claudeCurrentPath) {
+  if (route.view === 'codex' && agent?.codexCurrentPath) {
+    return 'codex';
+  }
+
+  if (route.view === 'claude' && agent?.claudeCurrentPath) {
+    return 'claude';
+  }
+
+  if (!agent?.claudeCurrentPath && !agent?.codexCurrentPath) {
     return 'byobu';
   }
 
-  return route.view === 'claude' ? 'claude' : 'byobu';
+  return 'byobu';
 }
 
 function getActiveByobuAgentId() {
@@ -483,16 +517,66 @@ function renderAgentDetail(agent) {
                 <div class="chat-page__body" data-chat-body>
                   <p class="chat-page__empty">Connecting to the Claude worker…</p>
                 </div>
-                <form class="chat-compose" data-chat-compose data-agent-id="${escapeAttr(agent.id)}">
-                  <textarea
-                    class="chat-compose__input"
-                    data-chat-input
-                    rows="3"
-                    placeholder="Send a new message to Claude…"
-                  ></textarea>
-                </form>
+                ${agent.claudePromptPath ? `
+                  <form class="chat-compose" data-chat-compose data-agent-id="${escapeAttr(agent.id)}">
+                    <textarea
+                      class="chat-compose__input"
+                      data-chat-input
+                      rows="3"
+                      placeholder="Send a new message to Claude…"
+                    ></textarea>
+                  </form>
+                ` : ''}
               </div>
               <aside class="chat-sidebar" data-chat-summary>
+                <p class="chat-page__empty">Waiting for session summary…</p>
+              </aside>
+            </section>
+          </section>
+        </section>
+    `);
+  }
+
+  if (agent.codexCurrentPath) {
+    panels.push(`
+        <section class="detail-panel detail-panel--chat" data-detail-panel="codex">
+          <section class="chat-page" data-codex-page data-agent-id="${escapeAttr(agent.id)}">
+            <header class="chat-page__header">
+              <div>
+                <p class="eyebrow">Codex</p>
+                <h2>Session Transcript</h2>
+              </div>
+              <div class="chat-page__actions">
+                <button class="chat-toggle" type="button" data-codex-summary-toggle data-agent-id="${escapeAttr(agent.id)}">Show sidebar</button>
+                <span class="agent-status is-syncing" data-codex-status>Syncing</span>
+              </div>
+            </header>
+            <section class="chat-session-meta" data-codex-meta>
+              <span>Waiting for session metadata…</span>
+            </section>
+            <section class="chat-page__layout">
+              <div class="chat-page__main">
+                <div class="chat-filters" data-codex-filters>
+                  ${renderCodexFilterButton(agent.id, 'all', 'All')}
+                  ${renderCodexFilterButton(agent.id, 'prompts', 'Prompts')}
+                  ${renderCodexFilterButton(agent.id, 'tools', 'Tool calls')}
+                  ${renderCodexFilterButton(agent.id, 'errors', 'Errors')}
+                </div>
+                <div class="chat-page__body" data-codex-body>
+                  <p class="chat-page__empty">Connecting to the Codex worker…</p>
+                </div>
+                ${agent.codexPromptPath ? `
+                  <form class="chat-compose" data-codex-compose data-agent-id="${escapeAttr(agent.id)}">
+                    <textarea
+                      class="chat-compose__input"
+                      data-codex-input
+                      rows="3"
+                      placeholder="Send a new message to Codex…"
+                    ></textarea>
+                  </form>
+                ` : ''}
+              </div>
+              <aside class="chat-sidebar" data-codex-summary>
                 <p class="chat-page__empty">Waiting for session summary…</p>
               </aside>
             </section>
@@ -577,16 +661,48 @@ function renderChatFilterButton(agentId, value, label) {
   `;
 }
 
+function renderCodexFilterButton(agentId, value, label) {
+  return `
+    <button
+      class="chat-filter"
+      type="button"
+      data-codex-filter="${escapeAttr(value)}"
+      data-agent-id="${escapeAttr(agentId)}"
+    >
+      ${escapeHtml(label)}
+    </button>
+  `;
+}
+
 function getChatFilter(agentId) {
   return state.chat.filterByAgent.get(agentId) || 'all';
+}
+
+function getCodexFilter(agentId) {
+  return state.codex.filterByAgent.get(agentId) || 'all';
 }
 
 function isChatSummaryOpen(agentId) {
   return state.chat.summaryOpenByAgent.get(agentId) || false;
 }
 
+function isCodexSummaryOpen(agentId) {
+  return state.codex.summaryOpenByAgent.get(agentId) || false;
+}
+
 function applyChatFilter(agentId, turns) {
   const filter = getChatFilter(agentId);
+  if (filter === 'tools') {
+    return turns.filter((turn) => (turn.toolUses || []).length || (turn.toolResults || []).length);
+  }
+  if (filter === 'errors') {
+    return turns.filter((turn) => turn.error || (turn.toolResults || []).some((item) => item.isError));
+  }
+  return turns;
+}
+
+function applyCodexFilter(agentId, turns) {
+  const filter = getCodexFilter(agentId);
   if (filter === 'tools') {
     return turns.filter((turn) => (turn.toolUses || []).length || (turn.toolResults || []).length);
   }
@@ -604,11 +720,30 @@ function syncChatFilters(agentId) {
   }
 }
 
+function syncCodexFilters(agentId) {
+  const view = state.views.detailById.get(agentId);
+  const filter = getCodexFilter(agentId);
+  for (const button of view?.querySelectorAll('[data-codex-filter]') || []) {
+    button.classList.toggle('is-active', button.dataset.codexFilter === filter);
+  }
+}
+
 function syncChatSummaryVisibility(agentId) {
   const view = state.views.detailById.get(agentId);
-  const layout = view?.querySelector('.chat-page__layout');
+  const layout = view?.querySelector('[data-chat-page] .chat-page__layout');
   const toggle = view?.querySelector('[data-chat-summary-toggle]');
   const isOpen = isChatSummaryOpen(agentId);
+  layout?.classList.toggle('is-summary-open', isOpen);
+  if (toggle instanceof HTMLButtonElement) {
+    toggle.textContent = isOpen ? 'Hide sidebar' : 'Show sidebar';
+  }
+}
+
+function syncCodexSummaryVisibility(agentId) {
+  const view = state.views.detailById.get(agentId);
+  const layout = view?.querySelector('[data-codex-page] .chat-page__layout');
+  const toggle = view?.querySelector('[data-codex-summary-toggle]');
+  const isOpen = isCodexSummaryOpen(agentId);
   layout?.classList.toggle('is-summary-open', isOpen);
   if (toggle instanceof HTMLButtonElement) {
     toggle.textContent = isOpen ? 'Hide sidebar' : 'Show sidebar';
@@ -650,12 +785,32 @@ function handleDocumentClick(event) {
     }
   }
 
+  const codexFilterButton = event.target.closest('[data-codex-filter]');
+  if (codexFilterButton instanceof HTMLButtonElement) {
+    const { agentId, codexFilter } = codexFilterButton.dataset;
+    if (agentId && codexFilter) {
+      state.codex.filterByAgent.set(agentId, codexFilter);
+      renderCodexChat(agentId, state.codex.byAgent.get(agentId));
+      return;
+    }
+  }
+
   const summaryToggle = event.target.closest('[data-chat-summary-toggle]');
   if (summaryToggle instanceof HTMLButtonElement) {
     const { agentId } = summaryToggle.dataset;
     if (agentId) {
       state.chat.summaryOpenByAgent.set(agentId, !isChatSummaryOpen(agentId));
       syncChatSummaryVisibility(agentId);
+      return;
+    }
+  }
+
+  const codexSummaryToggle = event.target.closest('[data-codex-summary-toggle]');
+  if (codexSummaryToggle instanceof HTMLButtonElement) {
+    const { agentId } = codexSummaryToggle.dataset;
+    if (agentId) {
+      state.codex.summaryOpenByAgent.set(agentId, !isCodexSummaryOpen(agentId));
+      syncCodexSummaryVisibility(agentId);
       return;
     }
   }
@@ -676,6 +831,20 @@ function handleDocumentSubmit(event) {
 
   const form = event.target.closest('[data-chat-compose]');
   if (!(form instanceof HTMLFormElement)) {
+    const codexForm = event.target.closest('[data-codex-compose]');
+    if (!(codexForm instanceof HTMLFormElement)) {
+      return;
+    }
+
+    event.preventDefault();
+    const { agentId } = codexForm.dataset;
+    if (!agentId) {
+      return;
+    }
+
+    submitCodexPrompt(agentId, codexForm).catch((error) => {
+      console.error(error);
+    });
     return;
   }
 
@@ -692,6 +861,28 @@ function handleDocumentSubmit(event) {
 
 function handleComposerKeydown(event) {
   if (!(event.target instanceof HTMLTextAreaElement) || !event.target.matches('[data-chat-input]')) {
+    if (!(event.target instanceof HTMLTextAreaElement) || !event.target.matches('[data-codex-input]')) {
+      return;
+    }
+
+    if (event.key !== 'Enter' || event.shiftKey) {
+      return;
+    }
+
+    const form = event.target.closest('[data-codex-compose]');
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+
+    event.preventDefault();
+    const { agentId } = form.dataset;
+    if (!agentId) {
+      return;
+    }
+
+    submitCodexPrompt(agentId, form).catch((error) => {
+      console.error(error);
+    });
     return;
   }
 
@@ -1175,6 +1366,16 @@ function startClaudeChatPolling(agent) {
   scheduleClaudeChatPoll(0);
 }
 
+function startCodexChatPolling(agent) {
+  if (!agent?.codexCurrentPath) {
+    stopCodexChatPolling();
+    return;
+  }
+
+  state.codex.activeAgentId = agent.id;
+  scheduleCodexChatPoll(0);
+}
+
 function startHistoryPolling(agent) {
   if (!agent?.historyPath) {
     stopHistoryPolling();
@@ -1210,6 +1411,16 @@ function stopClaudeChatPolling() {
   state.chat.activeAgentId = null;
 }
 
+function stopCodexChatPolling() {
+  if (state.codex.pollTimeoutId !== null) {
+    window.clearTimeout(state.codex.pollTimeoutId);
+    state.codex.pollTimeoutId = null;
+  }
+
+  state.codex.requestInFlight = false;
+  state.codex.activeAgentId = null;
+}
+
 function stopHistoryPolling() {
   if (state.history.pollTimeoutId !== null) {
     window.clearTimeout(state.history.pollTimeoutId);
@@ -1228,6 +1439,7 @@ function handleDocumentVisibilityChange() {
   scheduleDashboardStatePoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleLiveActivityPoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleClaudeChatPoll(document.hidden ? getDashboardStatePollDelay() : 0);
+  scheduleCodexChatPoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleHistoryPoll(document.hidden ? getDashboardStatePollDelay() : 0);
 }
 
@@ -1273,6 +1485,23 @@ function scheduleClaudeChatPoll(delayMs = getDashboardStatePollDelay()) {
     refreshClaudeChatState().catch((error) => {
       console.error(error);
       scheduleClaudeChatPoll();
+    });
+  }, Math.max(0, delayMs));
+}
+
+function scheduleCodexChatPoll(delayMs = getDashboardStatePollDelay()) {
+  if (state.codex.activeAgentId === null) {
+    return;
+  }
+
+  if (state.codex.pollTimeoutId !== null) {
+    window.clearTimeout(state.codex.pollTimeoutId);
+  }
+
+  state.codex.pollTimeoutId = window.setTimeout(() => {
+    refreshCodexChatState().catch((error) => {
+      console.error(error);
+      scheduleCodexChatPoll();
     });
   }, Math.max(0, delayMs));
 }
@@ -1348,6 +1577,34 @@ async function refreshClaudeChatState() {
   }
 }
 
+async function refreshCodexChatState() {
+  const agentId = state.codex.activeAgentId;
+  const agent = agentId
+    ? state.config?.agents.find((item) => item.id === agentId)
+    : null;
+
+  if (!agent?.codexCurrentPath || state.codex.requestInFlight) {
+    return;
+  }
+
+  state.codex.requestInFlight = true;
+
+  try {
+    const response = await fetch(agent.codexCurrentPath, { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Codex request failed with ${response.status}`);
+    }
+    state.codex.byAgent.set(agent.id, payload);
+    renderCodexChat(agent.id, payload);
+  } catch (error) {
+    renderCodexChat(agent.id, { error: error.message });
+  } finally {
+    state.codex.requestInFlight = false;
+    scheduleCodexChatPoll();
+  }
+}
+
 async function refreshHistoryState() {
   const agentId = state.history.activeAgentId;
   const agent = agentId
@@ -1415,6 +1672,49 @@ async function submitClaudePrompt(agentId, form) {
     state.chat.sendingByAgent.delete(agentId);
     input.disabled = false;
     input.placeholder = 'Send a new message to Claude…';
+    input.focus();
+  }
+}
+
+async function submitCodexPrompt(agentId, form) {
+  const agent = state.config?.agents.find((item) => item.id === agentId);
+  const input = form.querySelector('[data-codex-input]');
+  if (!agent?.codexPromptPath || !(input instanceof HTMLTextAreaElement)) {
+    return;
+  }
+
+  const text = input.value.trim();
+  if (!text || state.codex.sendingByAgent.has(agentId)) {
+    return;
+  }
+
+  state.codex.sendingByAgent.add(agentId);
+  input.disabled = true;
+  input.placeholder = 'Sending…';
+
+  try {
+    const response = await fetch(agent.codexPromptPath, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ text })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Prompt request failed with ${response.status}`);
+    }
+
+    input.value = '';
+    refreshCodexChatState().catch((error) => {
+      console.error(error);
+    });
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    state.codex.sendingByAgent.delete(agentId);
+    input.disabled = false;
+    input.placeholder = 'Send a new message to Codex…';
     input.focus();
   }
 }
@@ -1641,12 +1941,67 @@ function renderClaudeChat(agentId, payload) {
   const filter = getChatFilter(agentId);
   const turns = applyChatFilter(agentId, Array.isArray(session.turns) ? session.turns : []);
   body.innerHTML = turns.length
-    ? turns.map((turn) => renderClaudeTurn(turn, filter)).join('')
+    ? turns.map((turn) => renderTranscriptTurn('Claude', turn, filter)).join('')
     : `<p class="chat-page__empty">No turns match the <code>${escapeHtml(filter)}</code> filter.</p>`;
   if (!state.chat.didInitialScrollByAgent.get(agentId)) {
     requestAnimationFrame(() => {
       body.scrollTop = body.scrollHeight;
       state.chat.didInitialScrollByAgent.set(agentId, true);
+    });
+  }
+}
+
+function renderCodexChat(agentId, payload) {
+  const view = state.views.detailById.get(agentId);
+  const status = view?.querySelector('[data-codex-status]');
+  const body = view?.querySelector('[data-codex-body]');
+  const meta = view?.querySelector('[data-codex-meta]');
+  const summary = view?.querySelector('[data-codex-summary]');
+  if (!(status instanceof HTMLElement) || !(body instanceof HTMLElement) || !(meta instanceof HTMLElement) || !(summary instanceof HTMLElement)) {
+    return;
+  }
+
+  syncCodexFilters(agentId);
+  syncCodexSummaryVisibility(agentId);
+
+  if (payload?.error) {
+    status.textContent = 'Error';
+    status.className = 'agent-status is-waiting';
+    meta.innerHTML = '<span>Codex worker unavailable</span>';
+    summary.innerHTML = `<p class="chat-page__empty">${escapeHtml(payload.error)}</p>`;
+    body.innerHTML = `<p class="chat-page__empty">${escapeHtml(payload.error)}</p>`;
+    return;
+  }
+
+  const session = payload?.session || null;
+  if (!session) {
+    status.textContent = 'Idle';
+    status.className = 'agent-status is-syncing';
+    meta.innerHTML = '<span>No active Codex session</span>';
+    summary.innerHTML = '<p class="chat-page__empty">No session summary yet.</p>';
+    body.innerHTML = '<p class="chat-page__empty">No Codex session transcript is available yet.</p>';
+    return;
+  }
+
+  const statusText = {
+    running: 'Running',
+    waiting: 'Waiting',
+    error: 'Error'
+  }[session.status] || 'Syncing';
+  status.textContent = statusText;
+  status.className = `agent-status ${session.status === 'running' ? 'is-active' : session.status === 'error' ? 'is-waiting' : 'is-syncing'}`;
+  meta.innerHTML = renderChatMeta(session);
+  summary.innerHTML = renderChatSummary(session);
+
+  const filter = getCodexFilter(agentId);
+  const turns = applyCodexFilter(agentId, Array.isArray(session.turns) ? session.turns : []);
+  body.innerHTML = turns.length
+    ? turns.map((turn) => renderTranscriptTurn('Codex', turn, filter)).join('')
+    : `<p class="chat-page__empty">No turns match the <code>${escapeHtml(filter)}</code> filter.</p>`;
+  if (!state.codex.didInitialScrollByAgent.get(agentId)) {
+    requestAnimationFrame(() => {
+      body.scrollTop = body.scrollHeight;
+      state.codex.didInitialScrollByAgent.set(agentId, true);
     });
   }
 }
@@ -1685,7 +2040,7 @@ function renderHistory(agentId, payload) {
   }
 }
 
-function renderClaudeTurn(turn, filter) {
+function renderTranscriptTurn(label, turn, filter) {
   const showToolSections = filter !== 'prompts';
   const toolList = Array.isArray(turn.toolUses) && turn.toolUses.length && showToolSections
     ? `
@@ -1717,7 +2072,7 @@ function renderClaudeTurn(turn, filter) {
       ${toolList}
       ${toolResults}
       <header class="chat-turn__header">
-        <span class="chat-turn__label">Claude</span>
+        <span class="chat-turn__label">${escapeHtml(label)}</span>
       </header>
       <pre class="chat-turn__response">${escapeHtml(assistantText || 'No assistant response yet.')}</pre>
     </article>
@@ -2031,7 +2386,7 @@ function getRoute(pathname, search = '') {
     return {
       kind: 'agent',
       agentId: decodeURIComponent(agentMatch[1]),
-      view: view === 'byobu' || view === 'claude' || view === 'history' ? view : null
+      view: view === 'byobu' || view === 'claude' || view === 'codex' || view === 'history' ? view : null
     };
   }
 
