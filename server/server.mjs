@@ -450,6 +450,7 @@ app.get('/api/agents/:id/history', async (req, res) => {
 
   try {
     const targetUrl = new URL(agent.snapshotTarget);
+    targetUrl.pathname = targetUrl.pathname.replace(/\/(?:snapshot|history)\/?$/, '/history');
     targetUrl.searchParams.set('lines', String(lines));
     const response = await fetch(targetUrl, {
       headers: {

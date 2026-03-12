@@ -2,9 +2,19 @@
 
 import argparse
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"
+    r"|[@-Z\\-_]"
+    r"|\][^\x07]*(?:\x07|\x1b\\)"
+    r")"
+)
 
 
 def parse_args():
@@ -19,16 +29,24 @@ def parse_args():
     return parser.parse_args()
 
 
-def capture_snapshot(target, capture_lines):
+def strip_ansi(value):
+    return ANSI_ESCAPE_RE.sub("", value)
+
+
+def capture_snapshot(target, capture_lines, include_ansi=False):
     command = [
         "tmux",
         "capture-pane",
         "-pJ",
+    ]
+    if include_ansi:
+        command.append("-e")
+    command.extend([
         "-S",
         f"-{capture_lines}",
         "-t",
         target,
-    ]
+    ])
     completed = subprocess.run(
         command,
         check=False,
@@ -74,19 +92,24 @@ class SnapshotHandler(BaseHTTPRequestHandler):
             return
 
         requested_lines = min(requested_lines, self.max_capture_lines)
-        text, error = capture_snapshot(self.target, requested_lines)
+        include_ansi = parsed.path == "/history"
+        text, error = capture_snapshot(self.target, requested_lines, include_ansi=include_ansi)
         if error:
             self.respond_json(503, {"error": error})
             return
 
+        payload = {
+            "target": self.target,
+            "capturedAt": datetime.now(timezone.utc).isoformat(),
+            "lines": requested_lines,
+            "text": strip_ansi(text) if include_ansi else text,
+        }
+        if include_ansi:
+            payload["ansiText"] = text
+
         self.respond_json(
             200,
-            {
-                "target": self.target,
-                "capturedAt": datetime.now(timezone.utc).isoformat(),
-                "lines": requested_lines,
-                "text": text,
-            },
+            payload,
         )
 
     def log_message(self, format, *args):

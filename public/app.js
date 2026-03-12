@@ -14,6 +14,12 @@ const configSaveButton = document.querySelector('#config-save');
 const agentOrderStorageKey = 'agent-watch.agent-order';
 const inactiveAlertCooldownMs = 1200;
 const hiddenStatePollMs = 5000;
+const ansiSgrPattern = /\x1b\[([0-9;]*)m/g;
+const nonSgrAnsiPattern = /\x1b(?:\][^\u0007]*(?:\u0007|\x1b\\)|\[[0-?]*[ -/]*[@-ln-z~]|[@-Z\\-_])/g;
+const ansiDefaultForeground = '#d9e1ea';
+const ansiDefaultBackground = '#11161a';
+const ansiBasePalette = ['#262b33', '#e06c75', '#98c379', '#e5c07b', '#61afef', '#c678dd', '#56b6c2', '#d7dae0'];
+const ansiBrightPalette = ['#4f5666', '#ff7b86', '#b6e38b', '#ffd27a', '#7cc7ff', '#d49cff', '#7adfe4', '#f2f6fa'];
 const defaultMonitorConfig = Object.freeze({
   pollMs: 1000,
   activeWindowMs: 5000,
@@ -2030,7 +2036,7 @@ function renderHistory(agentId, payload) {
     <span>${escapeHtml(formatTimestamp(payload.capturedAt))}</span>
     <span>${escapeHtml(String(payload.lines || 0))} lines</span>
   `;
-  body.innerHTML = `<pre class="history-page__content">${escapeHtml(payload.text || '')}</pre>`;
+  body.innerHTML = renderHistoryContent(payload);
 
   if (!state.history.didInitialScrollByAgent.get(agentId)) {
     requestAnimationFrame(() => {
@@ -2042,6 +2048,8 @@ function renderHistory(agentId, payload) {
 
 function renderTranscriptTurn(label, turn, filter) {
   const showToolSections = filter !== 'prompts';
+  const toolResultsList = Array.isArray(turn.toolResults) ? turn.toolResults : [];
+  const toolResultText = toolResultsList.map((item) => item.stdout || item.text || '').filter(Boolean).join('\n\n');
   const toolList = Array.isArray(turn.toolUses) && turn.toolUses.length && showToolSections
     ? `
       <details class="chat-turn__section" open>
@@ -2052,11 +2060,11 @@ function renderTranscriptTurn(label, turn, filter) {
       </details>
     `
     : '';
-  const toolResults = Array.isArray(turn.toolResults) && turn.toolResults.length && showToolSections
+  const toolResults = toolResultsList.length && showToolSections
     ? `
       <details class="chat-turn__section">
-        <summary>Tool Results (${turn.toolResults.length})</summary>
-        <pre class="chat-turn__tool-results">${escapeHtml(turn.toolResults.map((item) => item.stdout || item.text || '').filter(Boolean).join('\n\n'))}</pre>
+        <summary>Tool Results (${toolResultsList.length})</summary>
+        ${renderAnsiTextBlock('chat-turn__tool-results', toolResultText)}
       </details>
     `
     : '';
@@ -2068,15 +2076,241 @@ function renderTranscriptTurn(label, turn, filter) {
         <span class="chat-turn__label">You</span>
         <time>${escapeHtml(formatTimestamp(turn.startedAt))}</time>
       </header>
-      <pre class="chat-turn__prompt">${escapeHtml(turn.userText || '')}</pre>
+      ${renderAnsiTextBlock('chat-turn__prompt', turn.userText || '')}
       ${toolList}
       ${toolResults}
       <header class="chat-turn__header">
         <span class="chat-turn__label">${escapeHtml(label)}</span>
       </header>
-      <pre class="chat-turn__response">${escapeHtml(assistantText || 'No assistant response yet.')}</pre>
+      ${renderAnsiTextBlock('chat-turn__response', assistantText || 'No assistant response yet.')}
     </article>
   `;
+}
+
+function renderAnsiTextBlock(className, value) {
+  const text = String(value || '');
+  if (containsAnsi(text)) {
+    return `<pre class="${className} ${className}--ansi">${ansiToHtml(text)}</pre>`;
+  }
+  return `<pre class="${className}">${escapeHtml(text)}</pre>`;
+}
+
+function containsAnsi(value) {
+  return /\x1b\[[0-9;]*m/.test(String(value || ''));
+}
+
+function renderHistoryContent(payload) {
+  const ansiText = typeof payload?.ansiText === 'string' ? payload.ansiText : null;
+  const historyHtml = ansiText === null
+    ? escapeHtml(payload?.text || '')
+    : ansiToHtml(ansiText);
+  const historyClass = ansiText === null
+    ? 'history-page__content'
+    : 'history-page__content history-page__content--ansi';
+  return `<pre class="${historyClass}">${historyHtml}</pre>`;
+}
+
+function ansiToHtml(value) {
+  const text = String(value || '');
+  let state = createAnsiState();
+  let output = '';
+  let lastIndex = 0;
+  ansiSgrPattern.lastIndex = 0;
+
+  for (let match = ansiSgrPattern.exec(text); match; match = ansiSgrPattern.exec(text)) {
+    output += renderAnsiChunk(text.slice(lastIndex, match.index), state);
+    state = applyAnsiSgr(state, match[1]);
+    lastIndex = ansiSgrPattern.lastIndex;
+  }
+
+  output += renderAnsiChunk(text.slice(lastIndex), state);
+  return output;
+}
+
+function createAnsiState() {
+  return {
+    fg: null,
+    bg: null,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    inverse: false
+  };
+}
+
+function renderAnsiChunk(value, state) {
+  if (!value) {
+    return '';
+  }
+
+  const text = escapeHtml(String(value).replace(nonSgrAnsiPattern, ''));
+  if (!text) {
+    return '';
+  }
+
+  const style = getAnsiStyle(state);
+  return style ? `<span style="${escapeAttr(style)}">${text}</span>` : text;
+}
+
+function getAnsiStyle(state) {
+  const effectiveFg = state.inverse ? (state.bg || ansiDefaultBackground) : state.fg;
+  const effectiveBg = state.inverse ? (state.fg || ansiDefaultForeground) : state.bg;
+  const parts = [];
+
+  if (effectiveFg) {
+    parts.push(`color:${effectiveFg}`);
+  }
+  if (effectiveBg) {
+    parts.push(`background:${effectiveBg}`);
+  }
+  if (state.bold) {
+    parts.push('font-weight:700');
+  }
+  if (state.dim) {
+    parts.push('opacity:0.72');
+  }
+  if (state.italic) {
+    parts.push('font-style:italic');
+  }
+  if (state.underline) {
+    parts.push('text-decoration:underline');
+  }
+
+  return parts.join(';');
+}
+
+function applyAnsiSgr(currentState, paramsText) {
+  const nextState = { ...currentState };
+  const parts = paramsText === ''
+    ? [0]
+    : paramsText.split(';').map((part) => Number.parseInt(part || '0', 10)).filter(Number.isFinite);
+  const codes = parts.length ? parts : [0];
+
+  for (let index = 0; index < codes.length; index += 1) {
+    const code = codes[index];
+
+    if (code === 0) {
+      Object.assign(nextState, createAnsiState());
+      continue;
+    }
+    if (code === 1) {
+      nextState.bold = true;
+      nextState.dim = false;
+      continue;
+    }
+    if (code === 2) {
+      nextState.dim = true;
+      continue;
+    }
+    if (code === 3) {
+      nextState.italic = true;
+      continue;
+    }
+    if (code === 4) {
+      nextState.underline = true;
+      continue;
+    }
+    if (code === 7) {
+      nextState.inverse = true;
+      continue;
+    }
+    if (code === 22) {
+      nextState.bold = false;
+      nextState.dim = false;
+      continue;
+    }
+    if (code === 23) {
+      nextState.italic = false;
+      continue;
+    }
+    if (code === 24) {
+      nextState.underline = false;
+      continue;
+    }
+    if (code === 27) {
+      nextState.inverse = false;
+      continue;
+    }
+    if (code === 39) {
+      nextState.fg = null;
+      continue;
+    }
+    if (code === 49) {
+      nextState.bg = null;
+      continue;
+    }
+    if (code >= 30 && code <= 37) {
+      nextState.fg = ansiBasePalette[code - 30];
+      continue;
+    }
+    if (code >= 90 && code <= 97) {
+      nextState.fg = ansiBrightPalette[code - 90];
+      continue;
+    }
+    if (code >= 40 && code <= 47) {
+      nextState.bg = ansiBasePalette[code - 40];
+      continue;
+    }
+    if (code >= 100 && code <= 107) {
+      nextState.bg = ansiBrightPalette[code - 100];
+      continue;
+    }
+    if (code === 38 || code === 48) {
+      const mode = codes[index + 1];
+      const isBackground = code === 48;
+      if (mode === 5) {
+        const colorIndex = codes[index + 2];
+        if (Number.isInteger(colorIndex)) {
+          if (isBackground) {
+            nextState.bg = ansiIndexedColor(colorIndex);
+          } else {
+            nextState.fg = ansiIndexedColor(colorIndex);
+          }
+        }
+        index += 2;
+        continue;
+      }
+      if (mode === 2) {
+        const red = codes[index + 2];
+        const green = codes[index + 3];
+        const blue = codes[index + 4];
+        if ([red, green, blue].every((value) => Number.isInteger(value) && value >= 0 && value <= 255)) {
+          const color = `rgb(${red}, ${green}, ${blue})`;
+          if (isBackground) {
+            nextState.bg = color;
+          } else {
+            nextState.fg = color;
+          }
+        }
+        index += 4;
+      }
+    }
+  }
+
+  return nextState;
+}
+
+function ansiIndexedColor(index) {
+  if (index >= 0 && index < ansiBasePalette.length) {
+    return ansiBasePalette[index];
+  }
+  if (index >= 8 && index < 16) {
+    return ansiBrightPalette[index - 8];
+  }
+  if (index >= 16 && index <= 231) {
+    const cube = index - 16;
+    const steps = [0, 95, 135, 175, 215, 255];
+    const red = steps[Math.floor(cube / 36) % 6];
+    const green = steps[Math.floor(cube / 6) % 6];
+    const blue = steps[cube % 6];
+    return `rgb(${red}, ${green}, ${blue})`;
+  }
+  if (index >= 232 && index <= 255) {
+    const level = 8 + (index - 232) * 10;
+    return `rgb(${level}, ${level}, ${level})`;
+  }
+  return null;
 }
 
 function renderToolUse(tool) {
