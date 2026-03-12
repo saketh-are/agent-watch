@@ -22,6 +22,7 @@ const httpOnly = process.env.HTTP_ONLY === '1';
 const auth = getAuthConfig();
 const terminalRootCacheTtlMs = 1000 * 60 * 10;
 const snapshotPreviewMaxLines = 28;
+const assetVersion = String(Date.now());
 let configCache = null;
 let configRawCache = null;
 let configWatcher = null;
@@ -29,30 +30,6 @@ let agentMonitorTimer = null;
 let agentMonitorRunning = false;
 const terminalRootCache = new Map();
 const agentMonitorState = new Map();
-const warpSolarizedDarkThemeLiteral = [
-  'theme:{',
-  'foreground:"#f8f8f2",',
-  'background:"#002b36",',
-  'cursor:"#f8f8f2",',
-  'selectionBackground:"rgba(147, 161, 161, 0.28)",',
-  'black:"#073642",',
-  'red:"#dc322f",',
-  'green:"#859900",',
-  'yellow:"#b58900",',
-  'blue:"#268bd2",',
-  'magenta:"#d33682",',
-  'cyan:"#2aa198",',
-  'white:"#eee8d5",',
-  'brightBlack:"#002b36",',
-  'brightRed:"#cb4b16",',
-  'brightGreen:"#586e75",',
-  'brightYellow:"#657b83",',
-  'brightBlue:"#839496",',
-  'brightMagenta:"#6c71c4",',
-  'brightCyan:"#93a1a1",',
-  'brightWhite:"#fdf6e3"',
-  '}'
-].join('');
 const terminalUnloadPatch = [
   '<script data-agent-watch="disable-unload-warning">',
   '(() => {',
@@ -77,81 +54,6 @@ const terminalUnloadPatch = [
   '      set() {}',
   '    });',
   '    window.onbeforeunload = null;',
-  '  } catch {}',
-  '  try {',
-  '    const terminalTheme = {',
-  '      foreground: "#f8f8f2",',
-  '      background: "#002b36",',
-  '      cursor: "#f8f8f2",',
-  '      selectionBackground: "rgba(147, 161, 161, 0.28)",',
-  '      black: "#073642",',
-  '      red: "#dc322f",',
-  '      green: "#859900",',
-  '      yellow: "#b58900",',
-  '      blue: "#268bd2",',
-  '      magenta: "#d33682",',
-  '      cyan: "#2aa198",',
-  '      white: "#eee8d5",',
-  '      brightBlack: "#002b36",',
-  '      brightRed: "#cb4b16",',
-  '      brightGreen: "#586e75",',
-  '      brightYellow: "#657b83",',
-  '      brightBlue: "#839496",',
-  '      brightMagenta: "#6c71c4",',
-  '      brightCyan: "#93a1a1",',
-  '      brightWhite: "#fdf6e3"',
-  '    };',
-  '    const applyTerminalTheme = () => {',
-  '      const term = window.term;',
-  '      if (!term || typeof term.setOption !== "function") return false;',
-  '      term.setOption("theme", terminalTheme);',
-  '      if (term.element) {',
-  '        term.element.style.backgroundColor = terminalTheme.background;',
-  '        term.element.style.color = terminalTheme.foreground;',
-  '      }',
-  '      document.documentElement.style.backgroundColor = terminalTheme.background;',
-  '      document.body.style.backgroundColor = terminalTheme.background;',
-  '      document.body.style.color = terminalTheme.foreground;',
-  '      return true;',
-  '    };',
-  '    if (!applyTerminalTheme()) {',
-  '      let attempts = 0;',
-  '      const timer = window.setInterval(() => {',
-  '        attempts += 1;',
-  '        if (applyTerminalTheme() || attempts > 80) {',
-  '          window.clearInterval(timer);',
-  '        }',
-  '      }, 100);',
-  '    }',
-  '  } catch {}',
-  '  try {',
-  '    const installTrackpadScroll = () => {',
-  '      const doc = window.document;',
-  '      const root = doc.querySelector(".xterm");',
-  '      const viewport = doc.querySelector(".xterm-viewport");',
-  '      if (!root || !viewport) return false;',
-  '      if (root.dataset.agentWatchTrackpadScroll === "1") return true;',
-  '      root.dataset.agentWatchTrackpadScroll = "1";',
-  '      doc.addEventListener("wheel", (event) => {',
-  '        if (!(event.target instanceof Element) || !event.target.closest(".xterm")) return;',
-  '        viewport.scrollTop += event.deltaY;',
-  '        try {',
-  '          const term = window.term;',
-  '          if (term && typeof term.focus === "function") term.focus();',
-  '        } catch {}',
-  '        event.preventDefault();',
-  '      }, { passive: false, capture: true });',
-  '      return true;',
-  '    };',
-  '    if (!installTrackpadScroll()) {',
-  '      let attempts = 0;',
-  '      const timer = window.setInterval(() => {',
-  '        attempts += 1;',
-  '        if (installTrackpadScroll() || attempts > 80) {',
-  '          window.clearInterval(timer);',
-  '        }',
-  '      }, 100);',
-  '    }',
   '  } catch {}',
   '})();',
   '</script>'
@@ -384,6 +286,57 @@ app.post('/api/agents/:id/claude/prompt', async (req, res) => {
   }
 });
 
+app.get('/api/agents/:id/history', async (req, res) => {
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    res.status(500).json({
+      error: 'Invalid dashboard configuration',
+      detail: error.message
+    });
+    return;
+  }
+
+  const agent = config.agents.find((item) => item.id === req.params.id);
+  if (!agent) {
+    res.status(404).json({ error: `Unknown agent "${req.params.id}"` });
+    return;
+  }
+
+  if (!agent.snapshotTarget) {
+    res.status(404).json({ error: `History is not configured for "${req.params.id}"` });
+    return;
+  }
+
+  const requestedLines = Number.parseInt(String(req.query.lines || '10000'), 10);
+  const lines = Number.isInteger(requestedLines) && requestedLines > 0
+    ? Math.min(requestedLines, 50000)
+    : 10000;
+
+  try {
+    const targetUrl = new URL(agent.snapshotTarget);
+    targetUrl.searchParams.set('lines', String(lines));
+    const response = await fetch(targetUrl, {
+      headers: {
+        accept: 'application/json',
+        ...(agent.headers || {})
+      }
+    });
+    const payload = await response.text();
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json; charset=utf-8')
+      .setHeader('cache-control', 'no-store')
+      .send(payload);
+  } catch (error) {
+    res.status(502).json({
+      error: 'Could not load agent history',
+      detail: error.message
+    });
+  }
+});
+
 app.get('/api/config-file', (_req, res) => {
   try {
     const { raw } = readConfigFile();
@@ -557,8 +510,11 @@ function buildPublicConfig(config) {
         badge: agent.badge || '',
         accent: agent.accent || '#d06d32',
         source: agent.sourceLabel || detailUpstream.host,
-        previewPath: `/terminal/${encodeURIComponent(agent.id)}/preview/`,
-        detailPath: `/terminal/${encodeURIComponent(agent.id)}/detail/`,
+        previewPath: `/terminal/${encodeURIComponent(agent.id)}/preview/?v=${encodeURIComponent(assetVersion)}`,
+        detailPath: `/terminal/${encodeURIComponent(agent.id)}/detail/?v=${encodeURIComponent(assetVersion)}`,
+        historyPath: agent.snapshotTarget
+          ? `/api/agents/${encodeURIComponent(agent.id)}/history`
+          : null,
         claudeCurrentPath: agent.claudeWorkerTarget
           ? `/api/agents/${encodeURIComponent(agent.id)}/claude/current`
           : null,
@@ -840,30 +796,15 @@ function getTerminalRootCacheKey(targetUrl) {
 }
 
 function patchTerminalHtml(html) {
-  const themedHtml = applyWarpTerminalTheme(html);
-
-  if (themedHtml.includes('data-agent-watch="disable-unload-warning"')) {
-    return themedHtml;
+  if (html.includes('data-agent-watch="disable-unload-warning"')) {
+    return html;
   }
 
-  if (themedHtml.includes('</head>')) {
-    return themedHtml.replace('</head>', `${terminalUnloadPatch}</head>`);
+  if (html.includes('</head>')) {
+    return html.replace('</head>', `${terminalUnloadPatch}</head>`);
   }
 
-  return `${terminalUnloadPatch}${themedHtml}`;
-}
-
-function applyWarpTerminalTheme(html) {
-  return html
-    .replace(/theme:\{\}/g, warpSolarizedDarkThemeLiteral)
-    .replace(/theme:\{[^}]*foreground:"#[0-9a-fA-F]{6}"[^}]*\}/g, warpSolarizedDarkThemeLiteral)
-    .replace(/rendererType:"webgl"/g, 'rendererType:"canvas"')
-    .replace(/\.xterm \.composition-view\{background:#000;color:#fff;/g, '.xterm .composition-view{background:#002b36;color:#f8f8f2;')
-    .replace(/overflow-y:scroll;/g, 'overflow-y:scroll;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;')
-    .replace(/\.xterm \.xterm-viewport\{background-color:#000;/g, '.xterm .xterm-viewport{background-color:#002b36;')
-    .replace(/body,html\{height:100%;margin:0;min-height:100%;overflow:hidden\}/g, 'body,html{height:100%;margin:0;min-height:100%;overflow:hidden;background:#002b36;color:#f8f8f2}')
-    .replace(/#terminal-container\{height:100%;margin:0 auto;padding:0;width:auto\}/g, '#terminal-container{height:100%;margin:0 auto;padding:0;width:auto;background:#002b36}')
-    .replace(/#terminal-container \.terminal\{height:calc\(100% - 10px\);padding:5px\}/g, '#terminal-container .terminal{height:calc(100% - 10px);padding:5px;background:#002b36}');
+  return `${terminalUnloadPatch}${html}`;
 }
 
 function startConfigWatcher() {

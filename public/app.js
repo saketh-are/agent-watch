@@ -49,6 +49,13 @@ const state = {
     summaryOpenByAgent: new Map(),
     didInitialScrollByAgent: new Map()
   },
+  history: {
+    pollTimeoutId: null,
+    requestInFlight: false,
+    activeAgentId: null,
+    byAgent: new Map(),
+    didInitialScrollByAgent: new Map()
+  },
   audio: {
     context: null,
     armed: false,
@@ -185,11 +192,18 @@ function renderCurrentRoute() {
     syncHomeTerminals(routeAgent.id);
     const detailView = ensureDetailView(routeAgent);
     syncAgentDetailMode(routeAgent, detailView);
-    if (getAgentViewMode(routeAgent) === 'claude') {
+    const mode = getAgentViewMode(routeAgent);
+    if (mode === 'claude') {
       disconnectDetailTerminals();
+      stopHistoryPolling();
       startClaudeChatPolling(routeAgent);
+    } else if (mode === 'history') {
+      disconnectDetailTerminals();
+      stopClaudeChatPolling();
+      startHistoryPolling(routeAgent);
     } else {
       stopClaudeChatPolling();
+      stopHistoryPolling();
       connectDetailTerminal(routeAgent);
     }
     showOnly(detailView);
@@ -198,6 +212,7 @@ function renderCurrentRoute() {
   }
 
   stopClaudeChatPolling();
+  stopHistoryPolling();
   disconnectDetailTerminals();
   syncHomeTerminals();
   showOnly(state.views.home);
@@ -242,22 +257,35 @@ function renderModeSwitcher(routeAgent) {
   }
 
   const supportsClaude = Boolean(routeAgent.claudeCurrentPath);
+  const supportsHistory = Boolean(routeAgent.historyPath);
   const mode = getAgentViewMode(routeAgent);
   const byobuHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=byobu`;
   const claudeHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=claude`;
+  const historyHref = `/agents/${encodeURIComponent(routeAgent.id)}?view=history`;
 
   modeSwitcher.hidden = false;
-  modeSwitcher.innerHTML = supportsClaude
-    ? `
+  const links = [];
+  if (supportsClaude) {
+    links.push(`
       <a class="mode-switcher__link ${mode === 'claude' ? 'is-active' : ''}" href="${escapeAttr(claudeHref)}" title="Claude" aria-label="Claude">💬</a>
-      <a class="mode-switcher__link ${mode === 'byobu' ? 'is-active' : ''}" href="${escapeAttr(byobuHref)}" title="Byobu" aria-label="Byobu">🖥️</a>
-    `
-    : `
-      <a class="mode-switcher__link is-active" href="${escapeAttr(byobuHref)}" title="Byobu" aria-label="Byobu">🖥️</a>
-    `;
+    `);
+  }
+  if (supportsHistory) {
+    links.push(`
+      <a class="mode-switcher__link ${mode === 'history' ? 'is-active' : ''}" href="${escapeAttr(historyHref)}" title="History" aria-label="History">📜</a>
+    `);
+  }
+  links.push(`
+    <a class="mode-switcher__link ${mode === 'byobu' ? 'is-active' : ''}" href="${escapeAttr(byobuHref)}" title="Byobu" aria-label="Byobu">🖥️</a>
+  `);
+  modeSwitcher.innerHTML = links.join('');
 }
 
 function getAgentViewMode(agent) {
+  if (route.view === 'history' && agent?.historyPath) {
+    return 'history';
+  }
+
   if (!agent?.claudeCurrentPath) {
     return 'byobu';
   }
@@ -412,10 +440,11 @@ function renderPreviewCard(agent) {
 }
 
 function renderAgentDetail(agent) {
+  const panels = [];
+
   if (agent.claudeCurrentPath) {
-    return `
-      <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
-        <section class="detail-panel detail-panel--chat" data-detail-panel="claude">
+    panels.push(`
+        <section class="detail-panel detail-panel--chat" data-detail-panel="claude" hidden>
           <section class="chat-page" data-chat-page data-agent-id="${escapeAttr(agent.id)}">
             <header class="chat-page__header">
               <div>
@@ -456,6 +485,34 @@ function renderAgentDetail(agent) {
             </section>
           </section>
         </section>
+    `);
+  }
+
+  if (agent.historyPath) {
+    panels.push(`
+        <section class="detail-panel detail-panel--history" data-detail-panel="history" hidden>
+          <section class="history-page" data-history-page data-agent-id="${escapeAttr(agent.id)}">
+            <header class="history-page__header">
+              <div>
+                <p class="eyebrow">History</p>
+                <h2>Byobu Scrollback</h2>
+              </div>
+              <div class="history-page__actions">
+                <span class="agent-status is-syncing" data-history-status>Syncing</span>
+              </div>
+            </header>
+            <section class="history-session-meta" data-history-meta>
+              <span>Loading pane history…</span>
+            </section>
+            <div class="history-page__body" data-history-body>
+              <p class="chat-page__empty">Loading terminal history…</p>
+            </div>
+          </section>
+        </section>
+    `);
+  }
+
+  panels.push(`
         <section class="detail-panel detail-panel--terminal" data-detail-panel="byobu" hidden>
           <section class="detail-terminal">
             <iframe
@@ -466,33 +523,26 @@ function renderAgentDetail(agent) {
             ></iframe>
           </section>
         </section>
-      </section>
-    `;
-  }
+  `);
 
   return `
     <section class="detail-page route-view route-view--agent is-inactive" data-route-view="agent" aria-hidden="true">
-      <section class="detail-terminal">
-        <iframe
-          class="terminal-frame terminal-frame--detail"
-          title="Interactive terminal for ${escapeAttr(agent.name)}"
-          data-detail-path="${escapeAttr(agent.detailPath)}"
-          referrerpolicy="no-referrer"
-        ></iframe>
-      </section>
+      ${panels.join('')}
     </section>
   `;
 }
 
 function syncAgentDetailMode(agent, view) {
-  if (!agent?.claudeCurrentPath || !(view instanceof HTMLElement)) {
+  if (!(view instanceof HTMLElement)) {
     return;
   }
 
   const mode = getAgentViewMode(agent);
   const chatPanel = view.querySelector('[data-detail-panel="claude"]');
+  const historyPanel = view.querySelector('[data-detail-panel="history"]');
   const byobuPanel = view.querySelector('[data-detail-panel="byobu"]');
   chatPanel?.toggleAttribute('hidden', mode !== 'claude');
+  historyPanel?.toggleAttribute('hidden', mode !== 'history');
   byobuPanel?.toggleAttribute('hidden', mode !== 'byobu');
 }
 
@@ -1216,6 +1266,16 @@ function startClaudeChatPolling(agent) {
   scheduleClaudeChatPoll(0);
 }
 
+function startHistoryPolling(agent) {
+  if (!agent?.historyPath) {
+    stopHistoryPolling();
+    return;
+  }
+
+  state.history.activeAgentId = agent.id;
+  scheduleHistoryPoll(0);
+}
+
 function stopDashboardStatePolling() {
   if (state.activity.pollTimeoutId !== null) {
     window.clearTimeout(state.activity.pollTimeoutId);
@@ -1241,6 +1301,16 @@ function stopClaudeChatPolling() {
   state.chat.activeAgentId = null;
 }
 
+function stopHistoryPolling() {
+  if (state.history.pollTimeoutId !== null) {
+    window.clearTimeout(state.history.pollTimeoutId);
+    state.history.pollTimeoutId = null;
+  }
+
+  state.history.requestInFlight = false;
+  state.history.activeAgentId = null;
+}
+
 function handleDocumentVisibilityChange() {
   if (!state.config) {
     return;
@@ -1249,6 +1319,7 @@ function handleDocumentVisibilityChange() {
   scheduleDashboardStatePoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleLiveActivityPoll(document.hidden ? getDashboardStatePollDelay() : 0);
   scheduleClaudeChatPoll(document.hidden ? getDashboardStatePollDelay() : 0);
+  scheduleHistoryPoll(document.hidden ? getDashboardStatePollDelay() : 0);
 }
 
 function scheduleDashboardStatePoll(delayMs = getDashboardStatePollDelay()) {
@@ -1293,6 +1364,23 @@ function scheduleClaudeChatPoll(delayMs = getDashboardStatePollDelay()) {
     refreshClaudeChatState().catch((error) => {
       console.error(error);
       scheduleClaudeChatPoll();
+    });
+  }, Math.max(0, delayMs));
+}
+
+function scheduleHistoryPoll(delayMs = getDashboardStatePollDelay()) {
+  if (state.history.activeAgentId === null) {
+    return;
+  }
+
+  if (state.history.pollTimeoutId !== null) {
+    window.clearTimeout(state.history.pollTimeoutId);
+  }
+
+  state.history.pollTimeoutId = window.setTimeout(() => {
+    refreshHistoryState().catch((error) => {
+      console.error(error);
+      scheduleHistoryPoll();
     });
   }, Math.max(0, delayMs));
 }
@@ -1348,6 +1436,34 @@ async function refreshClaudeChatState() {
   } finally {
     state.chat.requestInFlight = false;
     scheduleClaudeChatPoll();
+  }
+}
+
+async function refreshHistoryState() {
+  const agentId = state.history.activeAgentId;
+  const agent = agentId
+    ? state.config?.agents.find((item) => item.id === agentId)
+    : null;
+
+  if (!agent?.historyPath || state.history.requestInFlight) {
+    return;
+  }
+
+  state.history.requestInFlight = true;
+
+  try {
+    const response = await fetch(`${agent.historyPath}?lines=10000`, { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `History request failed with ${response.status}`);
+    }
+    state.history.byAgent.set(agent.id, payload);
+    renderHistory(agent.id, payload);
+  } catch (error) {
+    renderHistory(agent.id, { error: error.message });
+  } finally {
+    state.history.requestInFlight = false;
+    scheduleHistoryPoll();
   }
 }
 
@@ -1668,6 +1784,40 @@ function renderClaudeChat(agentId, payload) {
   }
 }
 
+function renderHistory(agentId, payload) {
+  const view = state.views.detailById.get(agentId);
+  const status = view?.querySelector('[data-history-status]');
+  const body = view?.querySelector('[data-history-body]');
+  const meta = view?.querySelector('[data-history-meta]');
+  if (!(status instanceof HTMLElement) || !(body instanceof HTMLElement) || !(meta instanceof HTMLElement)) {
+    return;
+  }
+
+  if (payload?.error) {
+    status.textContent = 'Error';
+    status.className = 'agent-status is-waiting';
+    meta.innerHTML = '<span>History unavailable</span>';
+    body.innerHTML = `<p class="chat-page__empty">${escapeHtml(payload.error)}</p>`;
+    return;
+  }
+
+  status.textContent = 'Ready';
+  status.className = 'agent-status is-active';
+  meta.innerHTML = `
+    <span>${escapeHtml(payload.target || 'unknown target')}</span>
+    <span>${escapeHtml(formatTimestamp(payload.capturedAt))}</span>
+    <span>${escapeHtml(String(payload.lines || 0))} lines</span>
+  `;
+  body.innerHTML = `<pre class="history-page__content">${escapeHtml(payload.text || '')}</pre>`;
+
+  if (!state.history.didInitialScrollByAgent.get(agentId)) {
+    requestAnimationFrame(() => {
+      body.scrollTop = body.scrollHeight;
+      state.history.didInitialScrollByAgent.set(agentId, true);
+    });
+  }
+}
+
 function renderClaudeTurn(turn, filter) {
   const showToolSections = filter !== 'prompts';
   const toolList = Array.isArray(turn.toolUses) && turn.toolUses.length && showToolSections
@@ -1883,7 +2033,7 @@ function htmlToElement(markup) {
 function focusRouteTerminal() {
   if (route.kind === 'agent') {
     const agent = state.config?.agents.find((item) => item.id === route.agentId);
-    if (getAgentViewMode(agent) === 'claude') {
+    if (getAgentViewMode(agent) !== 'byobu') {
       return;
     }
     const activeView = state.views.detailById.get(route.agentId);
@@ -1927,14 +2077,10 @@ function focusTerminalFrame(frame) {
     return;
   }
 
-  let attempts = 0;
-
   const tryFocus = () => {
     if (!frame.isConnected) {
       return;
     }
-
-    let focused = false;
 
     try {
       frame.focus();
@@ -1943,34 +2089,19 @@ function focusTerminalFrame(frame) {
       const term = frame.contentWindow?.term;
       if (term && typeof term.focus === 'function') {
         term.focus();
-        if (typeof term.scrollToBottom === 'function') {
-          term.scrollToBottom();
-        }
-        focused = true;
       }
 
       const doc = frame.contentDocument;
-      const viewport = doc?.querySelector('.xterm-viewport');
-      if (viewport instanceof HTMLElement) {
-        viewport.scrollTop = viewport.scrollHeight;
-      }
       const helper = doc?.querySelector('.xterm-helper-textarea');
       if (helper instanceof HTMLElement) {
         helper.focus({ preventScroll: true });
-        focused = true;
       } else {
         const xterm = doc?.querySelector('.xterm');
         if (xterm instanceof HTMLElement) {
           xterm.focus({ preventScroll: true });
-          focused = true;
         }
       }
     } catch {}
-
-    attempts += 1;
-    if (attempts < 12) {
-      setTimeout(tryFocus, focused ? 40 : 120);
-    }
   };
 
   requestAnimationFrame(tryFocus);
@@ -1984,7 +2115,7 @@ function getRoute(pathname, search = '') {
     return {
       kind: 'agent',
       agentId: decodeURIComponent(agentMatch[1]),
-      view: view === 'byobu' || view === 'claude' ? view : null
+      view: view === 'byobu' || view === 'claude' || view === 'history' ? view : null
     };
   }
 

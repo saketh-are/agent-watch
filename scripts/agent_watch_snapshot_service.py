@@ -15,6 +15,7 @@ def parse_args():
     parser.add_argument("--port", type=int, default=7810)
     parser.add_argument("--target", default="1")
     parser.add_argument("--capture-lines", type=int, default=160)
+    parser.add_argument("--max-capture-lines", type=int, default=50000)
     return parser.parse_args()
 
 
@@ -44,17 +45,36 @@ def capture_snapshot(target, capture_lines):
 class SnapshotHandler(BaseHTTPRequestHandler):
     target = "1"
     capture_lines = 160
+    max_capture_lines = 50000
 
     def do_GET(self):
-        if self.path == "/health":
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        if parsed.path == "/health":
             self.respond_json(200, {"ok": True})
             return
 
-        if self.path != "/snapshot":
+        if parsed.path not in {"/snapshot", "/history"}:
             self.respond_json(404, {"error": "Not found"})
             return
 
-        text, error = capture_snapshot(self.target, self.capture_lines)
+        requested_lines = self.capture_lines
+        if "lines" in params:
+            try:
+                requested_lines = int(params.get("lines", [str(self.capture_lines)])[0])
+            except (TypeError, ValueError):
+                self.respond_json(400, {"error": "lines must be an integer"})
+                return
+
+        if requested_lines < 1:
+            self.respond_json(400, {"error": "lines must be at least 1"})
+            return
+
+        requested_lines = min(requested_lines, self.max_capture_lines)
+        text, error = capture_snapshot(self.target, requested_lines)
         if error:
             self.respond_json(503, {"error": error})
             return
@@ -64,6 +84,7 @@ class SnapshotHandler(BaseHTTPRequestHandler):
             {
                 "target": self.target,
                 "capturedAt": datetime.now(timezone.utc).isoformat(),
+                "lines": requested_lines,
                 "text": text,
             },
         )
@@ -89,6 +110,7 @@ def main():
         {
             "target": args.target,
             "capture_lines": args.capture_lines,
+            "max_capture_lines": args.max_capture_lines,
         },
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
