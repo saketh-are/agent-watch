@@ -726,6 +726,7 @@ body.route-agent .route-view--not-found.is-active {
 }
 
 .detail-page {
+  position: relative;
   display: grid;
   grid-template-rows: minmax(0, 1fr);
   gap: 0;
@@ -734,7 +735,21 @@ body.route-agent .route-view--not-found.is-active {
 }
 
 .detail-panel {
+  position: absolute;
+  inset: 0;
   min-height: 0;
+}
+
+.detail-panel.is-active {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.detail-panel.is-inactive {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .detail-panel--chat,
