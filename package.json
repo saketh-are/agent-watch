@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node server/server.mjs",
     "start:http": "HTTP_ONLY=1 node server/server.mjs",
-    "dev": "node --watch server/server.mjs"
+    "dev": "node --watch server/server.mjs",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
   },
   "dependencies": {
     "express": "^5.1.0",

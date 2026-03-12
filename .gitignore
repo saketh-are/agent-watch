@@ -1,3 +1,5 @@
 node_modules
 config/agents.json
 .local
+playwright-report
+test-results

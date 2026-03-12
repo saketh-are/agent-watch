@@ -36,6 +36,23 @@ Private HTTPS dashboard for monitoring remote agent terminals, with live `Active
 
 The app generates a local self-signed certificate in `.local/certs/` if you do not provide one. Your browser will warn unless you trust that certificate or provide your own.
 
+## Testing
+
+Run the browser regression suite with:
+
+```bash
+npm run test:e2e
+```
+
+This starts:
+
+- a fake `ttyd` upstream that exposes three deterministic terminal tabs
+- the real Agent Watch server in HTTP mode against a temporary config
+- Playwright checks for:
+  - tabs staying warm across route switches
+  - typing going to the visible tab immediately after navigation
+  - text selection/highlighting continuing to work in the active terminal
+
 ## Config format
 
 `config/agents.json`:
