@@ -126,6 +126,9 @@ configButton?.addEventListener('click', () => {
 });
 configModal?.addEventListener('click', handleConfigModalClick);
 document.addEventListener('keydown', handleDocumentKeydown);
+window.addEventListener('resize', syncAppViewportHeight);
+window.visualViewport?.addEventListener('resize', syncAppViewportHeight);
+window.visualViewport?.addEventListener('scroll', syncAppViewportHeight);
 configReloadButton?.addEventListener('click', () => {
   loadConfigEditor().catch((error) => {
     setConfigStatus(error.message, true);
@@ -138,6 +141,7 @@ configSaveButton?.addEventListener('click', () => {
 });
 
 async function boot() {
+  syncAppViewportHeight();
   const [configResponse, stateResponse] = await Promise.all([
     fetch('/api/config', { cache: 'no-store' }),
     fetch('/api/state', { cache: 'no-store' })
@@ -155,6 +159,15 @@ async function boot() {
   renderCurrentRoute();
   startDashboardStatePolling();
   startLiveActivityPolling();
+}
+
+function syncAppViewportHeight() {
+  const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight || 0);
+  if (!viewportHeight) {
+    return;
+  }
+
+  document.documentElement.style.setProperty('--app-viewport-height', `${viewportHeight}px`);
 }
 
 function initializeViews(config) {

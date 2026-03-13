@@ -13,6 +13,7 @@
   --terminal-font-family: "Courier New", Courier, monospace;
   --terminal-font-size: 13px;
   --terminal-line-height: 1.2;
+  --app-viewport-height: 100dvh;
   --agent-accent: #d06d32;
 }
 
@@ -41,7 +42,7 @@ body {
 }
 
 body.route-agent {
-  height: 100dvh;
+  height: var(--app-viewport-height);
   overflow: hidden;
 }
 
@@ -69,7 +70,7 @@ code {
 }
 
 body.route-agent .app-shell {
-  height: 100dvh;
+  height: var(--app-viewport-height);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
 }
@@ -257,12 +258,16 @@ h3 {
   position: relative;
   display: inline-flex;
   align-items: center;
+  min-width: 0;
   padding: 0.24rem 0.46rem;
   border-radius: 0.42rem;
   background: rgba(255, 255, 255, 0.56);
   border: 1px solid rgba(24, 32, 39, 0.08);
   font-size: 0.78rem;
   line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: transform 160ms ease, background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
 }
 
@@ -1255,19 +1260,6 @@ body.route-agent .route-view--not-found.is-active {
     border-radius: 0.8rem;
   }
 
-  .nav-link,
-  .agent-button {
-    width: 100%;
-    justify-content: center;
-  }
-
-  .site-nav {
-    display: grid;
-    grid-template-columns: 1fr;
-    overflow-x: visible;
-  }
-
-  .site-header__top,
   .config-modal__header,
   .config-modal__footer {
     align-items: stretch;
@@ -1275,15 +1267,64 @@ body.route-agent .route-view--not-found.is-active {
   }
 
   .site-header__top {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.22rem;
+  }
+
+  .site-header__copy {
+    display: none;
+  }
+
+  .site-nav {
+    width: 100%;
+    gap: 0.16rem;
+    overflow: hidden;
+  }
+
+  .nav-link,
+  .agent-button {
+    width: auto;
+    justify-content: center;
+  }
+
+  .nav-link {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0.22rem 0.18rem;
+    font-size: 0.66rem;
+    letter-spacing: -0.01em;
+  }
+
+  .nav-link[data-agent-status] {
+    gap: 0.18rem;
+  }
+
+  .nav-link[data-agent-status]::after {
+    width: 0.3rem;
+    height: 0.3rem;
   }
 
   .site-header__actions {
-    justify-content: space-between;
+    justify-content: flex-end;
+    gap: 0.18rem;
+    min-width: 0;
+  }
+
+  .mode-switcher__link {
+    width: 1.55rem;
+    height: 1.55rem;
+  }
+
+  .site-header__button {
+    padding: 0.2rem 0.36rem;
+    font-size: 0.72rem;
   }
 
   .site-header__source {
-    max-width: none;
+    max-width: min(5.6rem, 24vw);
+    padding: 0.14rem 0.28rem;
+    font-size: 0.62rem;
   }
 
   .config-modal__actions {
